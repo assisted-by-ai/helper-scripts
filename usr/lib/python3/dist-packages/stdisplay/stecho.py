@@ -7,17 +7,17 @@
 
 """Safely print argument to stdout with echo's formatting."""
 
-from sys import argv, stdout
+import sys
 from stdisplay.stdisplay import stdisplay
 
 
 def main() -> None:
     """Safely print argument to stdout with echo's formatting."""
-    if len(argv) > 1:
-        untrusted_text = " ".join(argv[1:])
-        stdout.write(stdisplay(untrusted_text))
-    stdout.write("\n")
-    stdout.flush()
+    if len(sys.argv) > 1:
+        untrusted_text = " ".join(sys.argv[1:])
+        sys.stdout.write(stdisplay(untrusted_text))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

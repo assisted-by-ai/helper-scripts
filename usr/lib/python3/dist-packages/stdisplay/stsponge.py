@@ -7,8 +7,8 @@
 
 """Safely print stdin to stdout or file."""
 
+import os
 from sys import argv, stdin, stdout, modules
-import shutil
 from tempfile import NamedTemporaryFile
 from stdisplay.stdisplay import stdisplay
 
@@ -17,7 +17,7 @@ def main() -> None:
     """Safely print stdin to stdout or file."""
     # https://github.com/pytest-dev/pytest/issues/4843
     if "pytest" not in modules and stdin is not None:
-        stdin.reconfigure(errors="ignore")  # type: ignore
+        stdin.reconfigure(errors="replace")  # type: ignore
     untrusted_text_list = []
     if stdin is not None:
         for untrusted_text in stdin:
@@ -29,9 +29,22 @@ def main() -> None:
         with NamedTemporaryFile(mode="w", delete=False) as temp_file:
             temp_file.write(stdisplay("".join(untrusted_text_list)))
             temp_file.flush()
-        for file in argv[1:]:
-            shutil.copy2(temp_file.name, file)
-        temp_file.close()
+            temp_path = temp_file.name
+        try:
+            with open(temp_path, "rb") as source_file:
+                content = source_file.read()
+            for file in argv[1:]:
+                fd = os.open(
+                    file,
+                    os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "wb") as destination_file:
+                    destination_file.write(content)
+                    destination_file.flush()
+                    os.fchmod(destination_file.fileno(), 0o600)
+        finally:
+            os.unlink(temp_path)
 
 
 if __name__ == "__main__":

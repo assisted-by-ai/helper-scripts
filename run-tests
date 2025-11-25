@@ -6,13 +6,26 @@ pythonpath="${git_toplevel}/usr/lib/python3/dist-packages"
 export PYTHONPATH="${pythonpath}${PYTHONPATH+":${PYTHONPATH}"}"
 
 pytest=(python3 -m pytest -o 'python_files=tests/*.py')
+pytest_args=()
+for arg in "$@"; do
+  test_path="${pythonpath}/stdisplay/tests/${arg}.py"
+  if [[ "${arg}" != -* && "${arg}" != */* && -f "${test_path}" ]]; then
+    pytest_args+=("tests/${arg}.py")
+  else
+    pytest_args+=("${arg}")
+  fi
+done
+
+if [[ ${#pytest_args[@]} -eq 0 ]]; then
+  pytest_args=("${@}")
+fi
 black=(black --config="${pyrc}" --color --diff --check)
 pylint=(pylint --rcfile="${pyrc}")
 mypy=(mypy --config-file="${pyrc}")
 
 cd "${pythonpath}/stdisplay/"
 # Ideally, these variables should be ignored by the tests...
-NO_COLOR="" COLORTERM="" TERM="xterm-direct" "${pytest[@]}" "${@}"
+NO_COLOR="" COLORTERM="" TERM="xterm" "${pytest[@]}" "${pytest_args[@]}"
 "${black[@]}" .
 find . -type f -name "*.py" -print0 | xargs -0 "${pylint[@]}"
 "${mypy[@]}" .

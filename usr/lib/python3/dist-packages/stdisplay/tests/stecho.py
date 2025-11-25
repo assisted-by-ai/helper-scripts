@@ -32,6 +32,10 @@ class TestSTEcho(stdisplay.tests.TestSTBase):
             self.text_dirty_sanitized + "\n",
             self._test_util(argv=[self.text_dirty]),
         )
+        self.assertEqual(
+            self.text_malicious_sanitized + "\n",
+            self._test_util(argv=[self.text_malicious]),
+        )
 
 
 if __name__ == "__main__":

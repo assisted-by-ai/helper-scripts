@@ -6,8 +6,12 @@
 ##
 ## SPDX-License-Identifier: AGPL-3.0-or-later
 
+import importlib
+import io
+import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import stdisplay.tests
 
 
@@ -59,6 +63,46 @@ class TestSTTee(stdisplay.tests.TestSTBase):
         self.assertEqual(
             self.text_dirty_sanitized,
             Path(self.tmpfiles["fill2"]).read_text(encoding="utf-8"),
+        )
+
+    def test_sttee_replaces_invalid_bytes(self) -> None:
+        """Invalid bytes are surfaced as sanitized underscores."""
+
+        output_path = Path(self.tmpfiles["fill"])
+        invalid_bytes = b"a\xffb\n"
+        stdout_capture = io.StringIO()
+        pytest_module = sys.modules.pop("pytest", None)
+        try:
+            with patch.object(sys, "argv", ["sttee.py", str(output_path)]), patch(
+                "sys.stdin",
+                io.TextIOWrapper(io.BytesIO(invalid_bytes), encoding="utf-8"),
+            ), patch("sys.stdout", stdout_capture):
+                self._del_module()
+                importlib.import_module("stdisplay.sttee").main()
+        finally:
+            if pytest_module is not None:
+                sys.modules["pytest"] = pytest_module
+
+        self.assertEqual("a_b\n", stdout_capture.getvalue())
+        self.assertEqual("a_b\n", output_path.read_text(encoding="ascii"))
+
+    def test_sttee_sanitizes_control_and_bidi(self) -> None:
+        """Dangerous control characters are sanitized before writing."""
+
+        output_path = Path(self.tmpfiles["fill"])
+        stdout_capture = io.StringIO()
+        with patch.object(
+            sys, "argv", ["sttee.py", str(output_path)]
+        ), patch("sys.stdin", io.StringIO(self.text_malicious)), patch(
+            "sys.stdout", stdout_capture
+        ):
+            self._del_module()
+            importlib.import_module("stdisplay.sttee").main()
+
+        self.assertEqual(self.text_malicious_sanitized, stdout_capture.getvalue())
+        self.assertEqual(
+            self.text_malicious_sanitized,
+            output_path.read_text(encoding="ascii"),
         )
 
 
