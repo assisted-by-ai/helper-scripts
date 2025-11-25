@@ -16,7 +16,7 @@ def main() -> None:
     """Safely print stdin or file to stdout."""
     # https://github.com/pytest-dev/pytest/issues/4843
     if "pytest" not in modules and stdin is not None:
-        stdin.reconfigure(errors="ignore")  # type: ignore
+        stdin.reconfigure(errors="replace")  # type: ignore
     if len(argv) == 1:
         if stdin is not None:
             for untrusted_line in stdin:

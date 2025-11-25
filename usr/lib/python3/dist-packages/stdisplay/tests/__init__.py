@@ -34,6 +34,9 @@ class TestSTBase(unittest.TestCase):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.text_dirty = "\x1b[0mTest\x1b[2Kor\x1b]1;is\x1b\n[m"
         self.text_dirty_sanitized = "\x1b[0mTest_[2Kor_]1;is_\n[m"
+        self.text_malicious = "pre\u202e.js\u200b\x00post\n"
+        self.text_malicious_sanitized = "pre_.js__post\n"
+        self.text_malicious_file_sanitized = "pre___.js____post\n"
         super().__init__(*args, **kwargs)
 
     def setUp(self) -> None:
@@ -63,6 +66,20 @@ class TestSTBase(unittest.TestCase):
             "fill": self.tmpfiles_list[4],
             "fill2": self.tmpfiles_list[5],
         }
+
+        invalid_path = os.path.join(self.tmpdir, "invalid")
+        with open(invalid_path, "wb") as file:
+            file.write(b"a\xffb\n")
+            file.flush()
+            file.close()
+        self.tmpfiles["invalid"] = invalid_path
+
+        malicious_path = os.path.join(self.tmpdir, "malicious")
+        with open(malicious_path, "w", encoding="utf-8") as file:
+            file.write(self.text_malicious)
+            file.flush()
+            file.close()
+        self.tmpfiles["malicious"] = malicious_path
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmpdir)

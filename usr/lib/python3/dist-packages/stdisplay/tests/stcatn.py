@@ -30,6 +30,11 @@ class TestSTCatn(stdisplay.tests.TestSTBase):
                 [self.tmpfiles["raw"], self.tmpfiles["raw"]],
             ),
             (self.text_dirty_sanitized + "\n", [self.tmpfiles["dirty"]]),
+            (
+                self.text_malicious_sanitized,
+                [self.tmpfiles["malicious"]],
+            ),
+            ("a_b\n", [self.tmpfiles["invalid"]]),
         ]
         for text, argv in cases:
             with self.subTest(text=text, argv=argv):
