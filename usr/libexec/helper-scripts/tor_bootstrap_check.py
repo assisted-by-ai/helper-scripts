@@ -28,7 +28,11 @@ bootstrap_status = controller.get_info("status/bootstrap-phase")
 
 print(format(bootstrap_status))
 
-progress_percent = re.match('.* PROGRESS=([0-9]+).*', bootstrap_status)
+progress_percent = re.search(r"PROGRESS=([0-9]+)", bootstrap_status)
+
+if not progress_percent:
+    controller.close()
+    sys.exit(255)
 
 exit_code = int(progress_percent.group(1))
 
