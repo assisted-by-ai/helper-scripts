@@ -76,7 +76,27 @@ def get_sgr_support() -> int:
         setupterm()
         return tigetnum("colors")
     except curses_error:
-        return -2
+        ## Fall back to a sensible default when terminfo is unavailable. Some
+        ## environments (including CI) ship a minimal terminfo database that
+        ## lacks entries such as "xterm-direct" or "xterm-old". Avoid raising
+        ## and choose a conservative color count based on the requested TERM.
+        ##
+        ## *   "xterm-old" is commonly treated as a very limited terminal, so
+        ##     disable SGR handling by reporting no color support.
+        ## *   For other unknown terminals, assume the base 8-color palette so
+        ##     that standard reset codes remain intact.
+        term = environ.get("TERM", "")
+        if term == "xterm-old":
+            return -1
+        if "16color" in term:
+            return 2**4
+        if "88color" in term:
+            return 88
+        if "256color" in term:
+            return 256
+        if "direct" in term:
+            return 2**24
+        return 2**3
 
 
 def exclude_pattern(original_pattern: str, negate_pattern: list[str]) -> str:
