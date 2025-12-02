@@ -5,6 +5,10 @@
 
 # pylint: disable=missing-module-docstring,fixme
 
+import sys
+from io import StringIO
+from unittest import mock
+
 from strip_markup.tests.strip_markup import TestStripMarkupBase
 from stdisplay.tests.stdisplay import simple_escape_cases
 
@@ -19,31 +23,166 @@ class TestSanitizeString(TestStripMarkupBase):
     maxDiff = None
 
     argv0: str = "sanitize-string"
+    help_str: str = """\
+sanitize-string: Usage: sanitize-string [--help] max_length [string]
+  If no string is provided as an argument, the string is read from standard input.
+  Set max_length to 'nolimit' to allow arbitrarily long strings.
+"""
+
+    def _test_args_with_exit(
+        self,
+        stdout_string: str,
+        stderr_string: str,
+        args: list[str],
+        exit_code: int,
+    ) -> None:
+        stdout_buf: StringIO = StringIO()
+        stderr_buf: StringIO = StringIO()
+        args_arr: list[str] = [self.argv0, *args]
+        with (
+            mock.patch.object(sys, "argv", args_arr),
+            mock.patch.object(sys, "stdout", stdout_buf),
+            mock.patch.object(sys, "stderr", stderr_buf),
+        ):
+            result: int = sanitize_string_main()
+        self.assertEqual(stdout_buf.getvalue(), stdout_string)
+        self.assertEqual(stderr_buf.getvalue(), stderr_string)
+        self.assertEqual(result, exit_code)
+        stdout_buf.close()
+        stderr_buf.close()
 
     def test_help(self) -> None:
         """
         Ensure sanitize_string.py's help output is as expected.
         """
 
-        help_str: str = """\
-sanitize-string: Usage: sanitize-string [--help] max_length [string]
-  If no string is provided as an argument, the string is read from standard input.
-  Set max_length to 'nolimit' to allow arbitrarily long strings.
-"""
         self._test_args(
             main_func=sanitize_string_main,
             argv0=self.argv0,
             stdout_string="",
-            stderr_string=help_str,
+            stderr_string=self.help_str,
             args=["--help"],
         )
         self._test_args(
             main_func=sanitize_string_main,
             argv0=self.argv0,
             stdout_string="",
-            stderr_string=help_str,
+            stderr_string=self.help_str,
             args=["-h"],
         )
+
+    def test_usage_errors(self) -> None:
+        """Ensure argument validation errors emit usage and exit non-zero."""
+
+        error_cases: list[list[str]] = [
+            [],
+            ["-5"],
+            ["not-a-number"],
+            ["1", "2", "3"],
+        ]
+
+        for args in error_cases:
+            self._test_args_with_exit(
+                stdout_string="",
+                stderr_string=self.help_str,
+                args=args,
+                exit_code=1,
+            )
+
+    def test_missing_stdin(self) -> None:
+        """Verify sanitize_string exits cleanly when stdin is unavailable."""
+
+        stdout_buf: StringIO = StringIO()
+        stderr_buf: StringIO = StringIO()
+        args_arr: list[str] = [self.argv0, "nolimit"]
+        with (
+            mock.patch.object(sys, "argv", args_arr),
+            mock.patch.object(sys, "stdin", None),
+            mock.patch.object(sys, "stdout", stdout_buf),
+            mock.patch.object(sys, "stderr", stderr_buf),
+        ):
+            exit_code: int = sanitize_string_main()
+        self.assertEqual(stdout_buf.getvalue(), "")
+        self.assertEqual(stderr_buf.getvalue(), "")
+        self.assertEqual(exit_code, 0)
+        stdout_buf.close()
+        stderr_buf.close()
+
+    def test_stdin_without_reconfigure(self) -> None:
+        """Ensure sanitize_string tolerates stdin objects lacking reconfigure."""
+
+        stdout_buf: StringIO = StringIO()
+        stderr_buf: StringIO = StringIO()
+        stdin_buf: StringIO = StringIO("Sample input")
+        args_arr: list[str] = [self.argv0, "nolimit"]
+        original_pytest_module = sys.modules.pop("pytest", None)
+        try:
+            with (
+                mock.patch.object(sys, "argv", args_arr),
+                mock.patch.object(sys, "stdin", stdin_buf),
+                mock.patch.object(sys, "stdout", stdout_buf),
+                mock.patch.object(sys, "stderr", stderr_buf),
+            ):
+                exit_code: int = sanitize_string_main()
+        finally:
+            if original_pytest_module is not None:
+                sys.modules["pytest"] = original_pytest_module
+        self.assertEqual(stdout_buf.getvalue(), "Sample input")
+        self.assertEqual(stderr_buf.getvalue(), "")
+        self.assertEqual(exit_code, 0)
+        stdout_buf.close()
+        stderr_buf.close()
+
+    def test_unreadable_stdin_raises_error(self) -> None:
+        """Ensure unreadable stdin streams fail gracefully."""
+
+        class ExplodingStdin:
+            def read(self) -> str:  # pragma: no cover - invoked via main
+                raise ValueError("boom")
+
+        stdout_buf: StringIO = StringIO()
+        stderr_buf: StringIO = StringIO()
+        args_arr: list[str] = [self.argv0, "nolimit"]
+        with (
+            mock.patch.object(sys, "argv", args_arr),
+            mock.patch.object(sys, "stdin", ExplodingStdin()),
+            mock.patch.object(sys, "stdout", stdout_buf),
+            mock.patch.object(sys, "stderr", stderr_buf),
+        ):
+            exit_code: int = sanitize_string_main()
+        self.assertEqual(stdout_buf.getvalue(), "")
+        self.assertEqual(
+            stderr_buf.getvalue(),
+            "sanitize-string: failed to read from standard input\n",
+        )
+        self.assertEqual(exit_code, 1)
+        stdout_buf.close()
+        stderr_buf.close()
+
+    def test_missing_read_attribute_returns_error(self) -> None:
+        """Validate stdin objects without read cause a clean failure."""
+
+        class NoReadStdin:  # pragma: no cover - exercised indirectly
+            pass
+
+        stdout_buf: StringIO = StringIO()
+        stderr_buf: StringIO = StringIO()
+        args_arr: list[str] = [self.argv0, "nolimit"]
+        with (
+            mock.patch.object(sys, "argv", args_arr),
+            mock.patch.object(sys, "stdin", NoReadStdin()),
+            mock.patch.object(sys, "stdout", stdout_buf),
+            mock.patch.object(sys, "stderr", stderr_buf),
+        ):
+            exit_code: int = sanitize_string_main()
+        self.assertEqual(stdout_buf.getvalue(), "")
+        self.assertEqual(
+            stderr_buf.getvalue(),
+            "sanitize-string: standard input is unreadable\n",
+        )
+        self.assertEqual(exit_code, 1)
+        stdout_buf.close()
+        stderr_buf.close()
 
     def test_safe_strings(self) -> None:
         """

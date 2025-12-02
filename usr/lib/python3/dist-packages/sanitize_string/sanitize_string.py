@@ -72,9 +72,23 @@ def main() -> int:
     ## Read untrusted_string from stdin if needed
     if untrusted_string is None:
         if sys.stdin is not None:
-            if "pytest" not in sys.modules:
-                sys.stdin.reconfigure(errors="ignore")  # type: ignore
-            untrusted_string = sys.stdin.read()
+            if "pytest" not in sys.modules and hasattr(sys.stdin, "reconfigure"):
+                sys.stdin.reconfigure(errors="ignore")  # type: ignore[arg-type]
+            try:
+                read_fn = sys.stdin.read
+            except AttributeError:
+                print(
+                    "sanitize-string: standard input is unreadable", file=sys.stderr
+                )
+                return 1
+            try:
+                untrusted_string = read_fn()
+            except (OSError, ValueError):
+                print(
+                    "sanitize-string: failed to read from standard input",
+                    file=sys.stderr,
+                )
+                return 1
         else:
             ## No way to get an untrusted string, print nothing and
             ## exit successfully
