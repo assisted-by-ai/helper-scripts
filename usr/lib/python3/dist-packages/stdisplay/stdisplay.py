@@ -11,7 +11,7 @@ Sanitize text to be safely printed to the terminal.
 
 from curses import setupterm, tigetnum, error as curses_error
 from os import environ
-from re import compile as re_compile, sub as re_sub
+from re import compile as re_compile, sub as re_sub, search as re_search
 from typing import Optional
 
 
@@ -70,13 +70,42 @@ def get_sgr_support() -> int:
     """
     if environ.get("NO_COLOR"):
         return -1
-    if environ.get("COLORTERM") in ("truecolor", "24bit"):
+    colorterm = environ.get("COLORTERM")
+    if colorterm and colorterm.lower() in ("truecolor", "24bit"):
         return 2**24
+
+    def _heuristic_colors_from_term(term: str) -> int:
+        if "direct" in term:
+            return 2**24
+
+        term_colors = re_search(r"(\d+)[-_]?color", term)
+        if term_colors:
+            colors = int(term_colors.group(1))
+            if colors >= 256:
+                return 256
+            if colors >= 88:
+                return 88
+            if colors >= 16:
+                return 2**4
+            if colors >= 8:
+                return 2**3
+
+        if "old" in term:
+            return -1
+
+        if term.startswith("xterm"):
+            return 2**3
+
+        return -1
+
     try:
         setupterm()
-        return tigetnum("colors")
+        colors = tigetnum("colors")
+        if colors is None or colors < 1:
+            return _heuristic_colors_from_term(environ.get("TERM", "").lower())
+        return colors
     except curses_error:
-        return -2
+        return _heuristic_colors_from_term(environ.get("TERM", "").lower())
 
 
 def exclude_pattern(original_pattern: str, negate_pattern: list[str]) -> str:
