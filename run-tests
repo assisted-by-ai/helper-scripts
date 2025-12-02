@@ -33,6 +33,9 @@ for file in "${utils[@]}"; do
   "${mypy[@]}" -- "${file}"
 done
 
+cd "${git_toplevel}"
+python3 -m pytest tests/test_unicode_show.py "${@}"
+
 for util in "${stdin_file_read_utils[@]}"; do
   ./"${util}" <&-
   ./"${util}" - <&-

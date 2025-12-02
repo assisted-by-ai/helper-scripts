@@ -20,8 +20,15 @@ import string
 import io
 import os
 
+def env_var_is_set(name):
+    """Return True if the environment variable is present, even if empty."""
+
+    return os.getenv(name) is not None
+
+
 USE_COLOR = (
-    not os.getenv("NOCOLOR") and
+    not env_var_is_set("NOCOLOR") and
+    not env_var_is_set("NO_COLOR") and
     os.getenv("TERM") != "dumb" and
     sys.stdout.isatty()
 )
@@ -31,8 +38,10 @@ CYAN = "\033[96m"
 RESET = "\033[0m"
 
 VISIBLE_ASCII_RANGE = range(0x20, 0x7F)
-ALLOWED_WHITESPACE = {'\n', '\r', '\t'}
-SAFE_ASCII_SEMANTIC = set(string.ascii_letters + string.digits + string.punctuation + " \n\r\t")
+# Treat carriage returns as suspicious so they are surfaced instead of being
+# silently normalized away by universal newline handling.
+ALLOWED_WHITESPACE = {'\n', '\t'}
+SAFE_ASCII_SEMANTIC = set(string.ascii_letters + string.digits + string.punctuation + " \n\t")
 
 def colorize(text, color):
     return f"{color}{text}{RESET}" if USE_COLOR else text
@@ -53,7 +62,7 @@ def describe_char(c):
     semantically_allowed = c in SAFE_ASCII_SEMANTIC
 
     ## Purposeful redundancy for extra safety in character display.
-    if codepoint_allowed and semantically_allowed:
+    if codepoint_allowed and semantically_allowed and c.isprintable() and not c.isspace():
         display = c
     else:
         display = repr(c)
@@ -126,31 +135,46 @@ def scan_file(f, filename=None):
 
 if __name__ == "__main__":
     clean = True
+    had_error = False
     try:
         if len(sys.argv) > 1:
             for fname in sys.argv[1:]:
                 try:
                     ## Must not use errors='replace' because otherwise suspicious unicode might slip.
                     ## Fail closed for non-UTF-8.
-                    with open(fname, 'r', encoding='utf-8', errors='strict') as f:
+                    with open(
+                        fname,
+                        'r',
+                        encoding='utf-8',
+                        errors='strict',
+                        newline="",
+                    ) as f:
                         if scan_file(f, filename=fname):
                             clean = False
                 except UnicodeDecodeError as e:
                     print(f"[ERROR] Unicode decode error [{fname}]: {e}", file=sys.stderr)
-                    clean = False
+                    had_error = True
                 except Exception as e:
                     print(f"[ERROR] File read error [{fname}]: {e}", file=sys.stderr)
                     sys.exit(2)
         else:
             try:
-                stdin_buffer = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='strict')
+                stdin_buffer = io.TextIOWrapper(
+                    sys.stdin.buffer,
+                    encoding='utf-8',
+                    errors='strict',
+                    newline="",
+                )
                 if scan_file(stdin_buffer):
                     clean = False
             except UnicodeDecodeError as e:
                 print(f"[ERROR] Unicode decode error [stdin]: {e}", file=sys.stderr)
-                clean = False
+                had_error = True
     except Exception as e:
         print(f"[ERROR] Unexpected error [main]: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if had_error:
         sys.exit(2)
 
     if not clean:
