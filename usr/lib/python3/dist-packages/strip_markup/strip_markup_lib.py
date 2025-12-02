@@ -42,6 +42,16 @@ class StripMarkupEngine(HTMLParser):
         return self.text.getvalue()
 
 
+def _strip_control_characters(untrusted_string: str) -> str:
+    """
+    Remove control characters that could be used for terminal escapes.
+    """
+
+    return "".join(
+        char for char in untrusted_string if char.isprintable() or char in "\n\t"
+    )
+
+
 def strip_markup(untrusted_string: str) -> str:
     """
     Stripping function.
@@ -49,10 +59,10 @@ def strip_markup(untrusted_string: str) -> str:
 
     markup_stripper: StripMarkupEngine = StripMarkupEngine()
     markup_stripper.feed(untrusted_string)
-    strip_one_string: str = markup_stripper.get_data()
+    strip_one_string: str = _strip_control_characters(markup_stripper.get_data())
     markup_stripper = StripMarkupEngine()
     markup_stripper.feed(strip_one_string)
-    strip_two_string: str = markup_stripper.get_data()
+    strip_two_string: str = _strip_control_characters(markup_stripper.get_data())
     if strip_one_string == strip_two_string:
         return strip_one_string
 

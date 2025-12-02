@@ -24,6 +24,9 @@ def print_usage() -> None:
     )
 
 
+MAX_INPUT_BYTES = 1024 * 1024
+
+
 def main() -> int:
     """
     Main function.
@@ -52,13 +55,36 @@ def main() -> int:
             print_usage()
             return 1
         untrusted_string = arg_list[0]
+        if len(untrusted_string.encode()) > MAX_INPUT_BYTES:
+            print(
+                f"strip-markup: input exceeds maximum size of {MAX_INPUT_BYTES} bytes.",
+                file=sys.stderr,
+            )
+            return 1
 
     ## Read untrusted_string from stdin if needed
     if untrusted_string is None:
         if sys.stdin is not None:
-            if "pytest" not in sys.modules:
-                sys.stdin.reconfigure(errors="ignore")  # type: ignore
-            untrusted_string = sys.stdin.read()
+            if hasattr(sys.stdin, "buffer"):
+                raw_stdin = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+                if len(raw_stdin) > MAX_INPUT_BYTES:
+                    print(
+                        f"strip-markup: input exceeds maximum size of {MAX_INPUT_BYTES} bytes.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+                untrusted_string = raw_stdin.decode(encoding, errors="ignore")
+            else:
+                if "pytest" not in sys.modules and hasattr(sys.stdin, "reconfigure"):
+                    sys.stdin.reconfigure(errors="ignore")  # type: ignore
+                untrusted_string = sys.stdin.read(MAX_INPUT_BYTES + 1)
+                if len(untrusted_string.encode()) > MAX_INPUT_BYTES:
+                    print(
+                        f"strip-markup: input exceeds maximum size of {MAX_INPUT_BYTES} bytes.",
+                        file=sys.stderr,
+                    )
+                    return 1
         else:
             ## No way to get an untrusted string, print nothing and
             ## exit successfully
