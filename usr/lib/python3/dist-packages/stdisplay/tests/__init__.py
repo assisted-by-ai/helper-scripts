@@ -97,3 +97,47 @@ class TestSTBase(unittest.TestCase):
             module.main()
         result = str(stdout.getvalue())  # pylint: disable=no-member
         return result
+
+
+class TestGetSgrSupport(unittest.TestCase):
+    """
+    Validate SGR color detection fallbacks.
+    """
+
+    @patch("stdisplay.stdisplay.setupterm")
+    @patch("stdisplay.stdisplay.tigetnum", return_value=-2)
+    def test_heuristic_used_when_colors_unknown(
+        self, patched_tigetnum: Any, patched_setupterm: Any
+    ) -> None:
+        """
+        An unknown terminfo capability (-2) should fall back to TERM heuristics.
+        """
+
+        with patch.dict(
+            "stdisplay.stdisplay.environ",
+            {"TERM": "xterm-256color", "NO_COLOR": "", "COLORTERM": ""},
+            clear=True,
+        ):
+            self.assertEqual(get_sgr_support(), 256)
+
+        patched_setupterm.assert_called_once()
+        patched_tigetnum.assert_called_once_with("colors")
+
+    @patch("stdisplay.stdisplay.setupterm")
+    @patch("stdisplay.stdisplay.tigetnum", return_value=0)
+    def test_direct_color_entries_with_zero_colors(
+        self, patched_tigetnum: Any, patched_setupterm: Any
+    ) -> None:
+        """
+        Some direct-color terminfo entries report 0 colors; fall back to heuristics.
+        """
+
+        with patch.dict(
+            "stdisplay.stdisplay.environ",
+            {"TERM": "xterm-direct", "NO_COLOR": "", "COLORTERM": ""},
+            clear=True,
+        ):
+            self.assertEqual(get_sgr_support(), 2**24)
+
+        patched_setupterm.assert_called_once()
+        patched_tigetnum.assert_called_once_with("colors")
