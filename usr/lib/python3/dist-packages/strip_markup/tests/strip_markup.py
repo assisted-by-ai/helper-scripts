@@ -5,12 +5,12 @@
 
 # pylint: disable=missing-module-docstring,fixme
 
-import unittest
+import io
 import sys
-from io import StringIO
+import unittest
 from typing import Callable
 from unittest import mock
-from strip_markup.strip_markup import main as strip_markup_main
+from strip_markup.strip_markup import MAX_INPUT_BYTES, main as strip_markup_main
 
 
 class TestStripMarkupBase(unittest.TestCase):
@@ -36,8 +36,8 @@ class TestStripMarkupBase(unittest.TestCase):
         """
 
         args_arr: list[str] = [argv0, *args]
-        stdout_buf: StringIO = StringIO()
-        stderr_buf: StringIO = StringIO()
+        stdout_buf: io.StringIO = io.StringIO()
+        stderr_buf: io.StringIO = io.StringIO()
         with (
             mock.patch.object(sys, "argv", args_arr),
             mock.patch.object(sys, "stdout", stdout_buf),
@@ -47,6 +47,35 @@ class TestStripMarkupBase(unittest.TestCase):
         self.assertEqual(stdout_buf.getvalue(), stdout_string)
         self.assertEqual(stderr_buf.getvalue(), stderr_string)
         self.assertEqual(exit_code, 0)
+        stdout_buf.close()
+        stderr_buf.close()
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _test_args_failure(
+        self,
+        main_func: Callable[[], int],
+        argv0: str,
+        stdout_string: str,
+        stderr_string: str,
+        args: list[str],
+        exit_code: int = 1,
+    ) -> None:
+        """
+        Executes the provided main function expecting failure output.
+        """
+
+        args_arr: list[str] = [argv0, *args]
+        stdout_buf: io.StringIO = io.StringIO()
+        stderr_buf: io.StringIO = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", args_arr),
+            mock.patch.object(sys, "stdout", stdout_buf),
+            mock.patch.object(sys, "stderr", stderr_buf),
+        ):
+            returned_exit_code: int = main_func()
+        self.assertEqual(stdout_buf.getvalue(), stdout_string)
+        self.assertEqual(stderr_buf.getvalue(), stderr_string)
+        self.assertEqual(returned_exit_code, exit_code)
         stdout_buf.close()
         stderr_buf.close()
 
@@ -65,11 +94,12 @@ class TestStripMarkupBase(unittest.TestCase):
         ensures its output matches an expected value.
         """
 
-        stdout_buf: StringIO = StringIO()
-        stderr_buf: StringIO = StringIO()
-        stdin_buf: StringIO = StringIO()
-        stdin_buf.write(stdin_string)
-        stdin_buf.seek(0)
+        stdout_buf: io.StringIO = io.StringIO()
+        stderr_buf: io.StringIO = io.StringIO()
+        stdin_bytes: io.BytesIO = io.BytesIO()
+        stdin_bytes.write(stdin_string.encode("utf-8"))
+        stdin_bytes.seek(0)
+        stdin_buf: io.TextIOWrapper = io.TextIOWrapper(stdin_bytes, encoding="utf-8")
         args_arr: list[str] = [argv0, *args]
         with (
             mock.patch.object(sys, "argv", args_arr),
@@ -84,6 +114,44 @@ class TestStripMarkupBase(unittest.TestCase):
         stdout_buf.close()
         stderr_buf.close()
         stdin_buf.close()
+        stdin_bytes.close()
+
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _test_stdin_failure(
+        self,
+        main_func: Callable[[], int],
+        argv0: str,
+        stdout_string: str,
+        stderr_string: str,
+        args: list[str],
+        stdin_string: str,
+        exit_code: int = 1,
+    ) -> None:
+        """
+        Executes the provided main function expecting failure output when using stdin.
+        """
+
+        stdout_buf: io.StringIO = io.StringIO()
+        stderr_buf: io.StringIO = io.StringIO()
+        stdin_bytes: io.BytesIO = io.BytesIO()
+        stdin_bytes.write(stdin_string.encode("utf-8"))
+        stdin_bytes.seek(0)
+        stdin_buf: io.TextIOWrapper = io.TextIOWrapper(stdin_bytes, encoding="utf-8")
+        args_arr: list[str] = [argv0, *args]
+        with (
+            mock.patch.object(sys, "argv", args_arr),
+            mock.patch.object(sys, "stdin", stdin_buf),
+            mock.patch.object(sys, "stdout", stdout_buf),
+            mock.patch.object(sys, "stderr", stderr_buf),
+        ):
+            returned_exit_code: int = main_func()
+        self.assertEqual(stdout_buf.getvalue(), stdout_string)
+        self.assertEqual(stderr_buf.getvalue(), stderr_string)
+        self.assertEqual(returned_exit_code, exit_code)
+        stdout_buf.close()
+        stderr_buf.close()
+        stdin_buf.close()
+        stdin_bytes.close()
 
     def _test_safe_strings(
         self,
@@ -369,3 +437,85 @@ input.
         """
 
         self._test_malicious_markup_strings(strip_markup_main, self.argv0)
+
+    def test_control_characters_are_removed(self) -> None:
+        """
+        Ensure decoded control characters are stripped from output.
+        """
+
+        self._test_args(
+            main_func=strip_markup_main,
+            argv0=self.argv0,
+            stdout_string="control  sequence",
+            stderr_string="",
+            args=["control &#27; sequence"],
+        )
+
+    def test_carriage_return_is_removed(self) -> None:
+        """
+        Ensure carriage returns cannot be used for overprinting attacks.
+        """
+
+        self._test_args(
+            main_func=strip_markup_main,
+            argv0=self.argv0,
+            stdout_string="line one overwritten", 
+            stderr_string="",
+            args=["line one&#13; overwritten"],
+        )
+
+    def test_rejects_oversized_argument(self) -> None:
+        """
+        Ensure overly large arguments are rejected to avoid excessive memory use.
+        """
+
+        oversized_input: str = "x" * (MAX_INPUT_BYTES + 1)
+        error_msg: str = (
+            f"strip-markup: input exceeds maximum size of {MAX_INPUT_BYTES} bytes.\n"
+        )
+        self._test_args_failure(
+            main_func=strip_markup_main,
+            argv0=self.argv0,
+            stdout_string="",
+            stderr_string=error_msg,
+            args=[oversized_input],
+        )
+
+    def test_rejects_oversized_stdin(self) -> None:
+        """
+        Ensure overly large stdin payloads are rejected.
+        """
+
+        oversized_input: str = "y" * (MAX_INPUT_BYTES + 1)
+        error_msg: str = (
+            f"strip-markup: input exceeds maximum size of {MAX_INPUT_BYTES} bytes.\n"
+        )
+        self._test_stdin_failure(
+            main_func=strip_markup_main,
+            argv0=self.argv0,
+            stdout_string="",
+            stderr_string=error_msg,
+            args=[],
+            stdin_string=oversized_input,
+        )
+
+    def test_rejects_multibyte_oversized_stdin(self) -> None:
+        """
+        Ensure byte-size enforcement applies when stdin includes multibyte characters.
+        """
+
+        multibyte_char: str = "€"
+        multibyte_oversized_input: str = multibyte_char * (
+            (MAX_INPUT_BYTES // len(multibyte_char.encode("utf-8"))) + 1
+        )
+        error_msg: str = (
+            f"strip-markup: input exceeds maximum size of {MAX_INPUT_BYTES} bytes.\n"
+        )
+        self._test_stdin_failure(
+            main_func=strip_markup_main,
+            argv0=self.argv0,
+            stdout_string="",
+            stderr_string=error_msg,
+            args=[],
+            stdin_string=multibyte_oversized_input,
+        )
