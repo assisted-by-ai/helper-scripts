@@ -16,14 +16,20 @@
 ## File writes are done atomically if possible, by writing data to a temporary
 ## file first and then moving that file to replace the original.
 
-import sys
 import os
 import shutil
+import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 
-executable_name = Path(sys.argv[1]).name
+def _get_executable_name() -> str:
+    if len(sys.argv) > 1:
+        return Path(sys.argv[1]).name
+    return Path(sys.argv[0]).name
+
+
+executable_name = _get_executable_name()
 
 
 def print_usage_and_bail():
