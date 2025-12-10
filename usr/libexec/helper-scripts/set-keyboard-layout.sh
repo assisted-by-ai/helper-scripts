@@ -18,19 +18,19 @@ set -o pipefail
 error_handler() {
   exit_code="${?}"
   printf '%s\n' "\
+$0: error_handler:
 BASH_COMMAND: ${BASH_COMMAND}
 exit_code: ${exit_code}"
   exit "${exit_code}"
 }
 
 exit_handler() {
-  [[ -v "exit_code" ]] || exit_code="0"
+  exit_code="${?}"
   printf '%s\n' ""
   if [ "$exit_code" = 0 ]; then
     printf '%s\n' "$0: INFO: OK."
   else
     printf '%s\n' "$0: ERROR: Exiting with code '$exit_code'." >&2
-
   fi
   exit "$exit_code"
 }
@@ -253,47 +253,13 @@ replace_file_variables() {
 ## Sets the XKB layout(s), variant(s), and option(s) in 'labwc', either for just
 ## this session or persistently.
 set_labwc_keymap() {
-  local args=("$@")
   local labwc_config_bak_path var_idx labwc_env_file_string \
-    labwc_config_directory \
-    calc_replace_args labwc_existing_config
+    labwc_config_directory calc_replace_args labwc_existing_config
 
   labwc_config_bak_path=''
 
-  ## We must have at least one, but no more than three, arguments specifying the
-  ## keyboard layout(s).
-  if [ "${#args[@]}" = '0' ] || [ -z "${args[0]:-}" ] \
-    || (( ${#args[@]} > 3 )); then
-    ## The print_usage function is provided by the script that sources this
-    ## library.
-    print_usage
-    exit 1
-  fi
-
-  ## If we have less than three arguments, populate the `args` array with empty
-  ## strings for the remaining arguments. This will make 'labwc' unset the
-  ## corresponding XKB environment variables internally, allowing the user to
-  ## run something like `set-labwc-keymap us colemak`, then
-  ## `set-labwc-keymap us` and have their keyboard not stuck in the Colemak
-  ## layout after the second command.
-  while (( ${#args[@]} < 3 )); do
-    args+=( '' )
-  done
-
-  ## Interactive mode checks the layouts for us already, no need to do it
-  ## twice.
-  if [ "${skl_interactive}" = 'false' ]; then
-    check_keyboard_layouts "${args[0]}" || return 1
-    if [ -n "${args[1]:-}" ]; then
-      check_keyboard_layout_variants "${args[0]}" "${args[1]}" || return 1
-    fi
-    if [ -n "${args[2]:-}" ]; then
-      check_keyboard_layout_options "${args[2]}" || return 1
-    fi
-  fi
-
   if test -d "${labwc_config_path}"; then
-    printf '%s\n' "${FUNCNAME[0]}: ERROR: --config='${labwc_config_path}' is a folder but should be a file!" >&2
+    printf '%s\n' "${FUNCNAME[0]}: ERROR: labwc configuration path '${labwc_config_path}' is a folder but should be a file!" >&2
     return 1
   fi
 
@@ -348,26 +314,30 @@ set_labwc_keymap() {
     return 1
   fi
 
-  if [ "${no_reload}" = 'false' ]; then
-    if ischroot --default-false; then
-      printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping executing 'labwc --reconfigure' inside chroot, ok."
-    elif pgrep -- labwc >/dev/null; then
-      ## 'labwc' is running. So the user most likely wishes the change to instantly apply.
-      ## Therefore let's run 'labwc --reconfigure'.
-      if ! command -v labwc >/dev/null; then
-        ## This would be weird. 'labwc' is running but unavailable in the PATH environment variable.
-        printf '%s\n' "${FUNCNAME[0]}: ERROR: The 'labwc' program is unavailable in the PATH environment variable or not installed." >&2
-      else
-        ## 'labwc' is running and available in the PATH environment variable.
-        if labwc --reconfigure; then
-          printf '%s\n' "${FUNCNAME[0]}: INFO: 'labwc --reconfigure' OK."
-        else
-          printf '%s\n' "${FUNCNAME[0]}: WARNING: 'labwc --reconfigure' reconfiguration failed!"
-        fi
-      fi
+  if [ "${no_reload}" = 'true' ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping command 'labwc --reconfigure' due to '--no-reload' option."
+  elif [ "${do_live_changes}" = 'false' ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping command 'labwc --reconfigure' due to '--no-live-changes' option."
+  elif ischroot --default-false; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping executing 'labwc --reconfigure' inside chroot, ok."
+  elif [ "$(id --user)" = 0 ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping executing 'labwc --reconfigure' because running as root, ok."
+  elif pgrep -- labwc >/dev/null; then
+    ## 'labwc' is running. So the user most likely wishes the change to instantly apply.
+    ## Therefore let's run 'labwc --reconfigure'.
+    if ! command -v labwc >/dev/null; then
+      ## This would be weird. 'labwc' is running but unavailable in the PATH environment variable.
+      printf '%s\n' "${FUNCNAME[0]}: ERROR: The 'labwc' program is unavailable in the PATH environment variable or not installed." >&2
     else
-      printf '%s\n' "${FUNCNAME[0]}: INFO: 'labwc' not running, no need to execute 'labwc --reconfigure', OK."
+      ## 'labwc' is running and available in the PATH environment variable.
+      if labwc --reconfigure; then
+        printf '%s\n' "${FUNCNAME[0]}: INFO: 'labwc --reconfigure' OK."
+      else
+        printf '%s\n' "${FUNCNAME[0]}: WARNING: 'labwc --reconfigure' reconfiguration failed!" >&2
+      fi
     fi
+  else
+    printf '%s\n' "${FUNCNAME[0]}: INFO: 'labwc' not running, no need to execute 'labwc --reconfigure', OK."
   fi
 
   ## If we do not want to persist the new configuration, put the old
@@ -422,13 +392,17 @@ dpkg_reconfigure_function() {
 }
 
 dracut_run() {
+  if [ "${do_live_changes}" = 'false' ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping command 'dracut --regenerate-all --force' due to '--no-live-changes' option."
+    return 0
+  fi
   if ischroot --default-false; then
     ## Inside chroot such as during image builds it may be best to leave running dracut to the build tool.
     printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping command 'dracut --regenerate-all --force' inside chroot, ok."
     return 0
   fi
   if ! command -v dracut >/dev/null; then
-    printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. The 'dracut' program is unavailable in the PATH environment variable or not installed. Keyboard layout in initramfs unchanged."
+    printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. The 'dracut' program is unavailable in the PATH environment variable or not installed. Keyboard layout in initramfs unchanged." >&2
     return 0
   fi
   printf '%s\n' "${FUNCNAME[0]}: INFO: Rebuilding all dracut initramfs images... This will take a while..."
@@ -447,8 +421,8 @@ dracut_run() {
 ## Quote 'man setupcon':
 ##   The keyboard configuration is specified in ~/.keyboard or /etc/default/keyboard.
 ##
-## However, this does not help much because even if '~/.keyboard' still 'setupcon'
-## cannot be run without root rights.
+## However, this does not help much because even if '~/.keyboard' exists,
+## 'setupcon' still cannot be run without root rights.
 ## It may be possible to set 'setupcon' (or 'loadkeys'?) SUID, however this is unwanted
 ## for security reasons.
 ## https://www.kicksecure.com/wiki/SUID_Disabler_and_Permission_Hardener
@@ -470,43 +444,13 @@ dracut_run() {
 ##     forced to hard-reboot your computer if you run setupcon with this
 ##     option and the screen is controlled by a X server.
 set_console_keymap() {
-  local args=("$@")
   local var_idx kb_conf_file_string kb_conf_path kb_conf_dir \
     calc_replace_args dpkg_reconfigure_command
 
   printf '%s\n' "${FUNCNAME[0]}: INFO: Console keymap configuration..."
 
-  ## Parse command line arguments
   kb_conf_dir='/etc/default'
   kb_conf_path="${kb_conf_dir}/keyboard"
-
-  ## We must have at least one, but no more than three, arguments specifying the
-  ## keyboard layout(s).
-  if [ "${#args[@]}" = '0' ] || [ -z "${args[0]:-}" ] \
-    || (( ${#args[@]} > 3 )); then
-    ## The print_usage function is provided by the script that sources this
-    ## library.
-    print_usage
-    exit 1
-  fi
-
-  ## If we have less than three arguments, populate the `args` array with empty
-  ## strings for the remaining arguments.
-  while (( ${#args[@]} < 3 )); do
-    args+=( '' )
-  done
-
-  ## Interactive mode checks the layouts for us already, no need to do it
-  ## twice.
-  if [ "${skl_interactive}" = 'false' ]; then
-    check_keyboard_layouts "${args[0]}" || return 1
-    if [ -n "${args[1]:-}" ]; then
-      check_keyboard_layout_variants "${args[0]}" "${args[1]}" || return 1
-    fi
-    if [ -n "${args[2]:-}" ]; then
-      check_keyboard_layout_options "${args[2]}" || return 1
-    fi
-  fi
 
   if ! mkdir --parents -- "${kb_conf_dir}" ; then
     printf '%s\n' "${FUNCNAME[0]}: ERROR: Cannot ensure the existence of '${kb_conf_dir}'!" >&2
@@ -542,6 +486,11 @@ set_console_keymap() {
   ## Apply the changes to the config file to the system.
   dpkg_reconfigure_function "${dpkg_reconfigure_command[@]}"
 
+  if [ "${do_live_changes}" = 'false' ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping command 'systemctl --no-block --no-pager restart keyboard-setup.service' due to '--no-live-changes' option."
+    return 0
+  fi
+
   if ischroot --default-false; then
     printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping command 'systemctl --no-block --no-pager restart keyboard-setup.service' inside chroot, ok."
     return 0
@@ -553,20 +502,26 @@ set_console_keymap() {
     if "${timeout_command[@]}" systemctl --no-block --no-pager restart keyboard-setup.service; then
       printf '%s\n' "${FUNCNAME[0]}: INFO: Restart of systemd unit 'keyboard-setup.service' success."
     else
-      printf '%s\n' "${FUNCNAME[0]}: WARNING: Restart of systemd unit 'keyboard-setup.service' failed. Reboot may be required to change the virtual console keyboard layout."
+      printf '%s\n' "${FUNCNAME[0]}: WARNING: Restart of systemd unit 'keyboard-setup.service' failed. Reboot may be required to change the virtual console keyboard layout." >&2
     fi
   else
-    printf '%s\n' "${FUNCNAME[0]}: WARNING: Systemd unit 'keyboard-setup.service' is not running or does not exist. Reboot may be required to change the virtual console keyboard layout."
+    printf '%s\n' "${FUNCNAME[0]}: WARNING: Systemd unit 'keyboard-setup.service' is not running or does not exist. Reboot may be required to change the virtual console keyboard layout." >&2
   fi
 
   printf '%s\n' "${FUNCNAME[0]}: INFO: system console configuration success."
 }
 
 ## NOTE: This function assumes it is run as root.
-kb_reload_root() {
-  local loginctl_users_json user_list uid_list user_name uid wl_sock wl_pid wl_comm account_name counter
+labwc_kb_reload_root() {
+  local loginctl_users_json loginctl_users_parsed user_list uid_list \
+    user_name line uid wl_sock wl_pid wl_comm account_name counter
 
   printf '%s\n' "${FUNCNAME[0]}: INFO: Reloading keyboard layout..."
+
+  if [ "${do_live_changes}" = 'false' ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping sending SIGHUP to 'labwc' due to '--no-live-changes' option."
+    return 0
+  fi
 
   if ischroot --default-false; then
     printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping sending SIGHUP to 'labwc' inside chroot, ok."
@@ -588,7 +543,7 @@ kb_reload_root() {
   )" || true
 
   if [ "$loginctl_users_json" = "" ]; then
-    printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. 'loginctl -j list-users' returned no users. Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout."
+    printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. 'loginctl -j list-users' returned no users. Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout." >&2
     return 0
   fi
 
@@ -597,7 +552,7 @@ kb_reload_root() {
   if [ "$loginctl_users_parsed" = "" ]; then
     printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. Failed to parse 'loginctl_users_json' using 'jq'.
 loginctl_users_json: '$loginctl_users_json'
-Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout."
+Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout." >&2
     return 0
   fi
 
@@ -633,7 +588,7 @@ Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layo
       account_name="$(id --name --user -- "${uid}")"
 
       if [ "${wl_comm}" = 'labwc' ]; then
-        counter=$(( counter + 1))
+        counter=$(( counter + 1 ))
         ## From the labwc manpage:
         ##
         ## -r, --reconfigure
@@ -655,10 +610,10 @@ Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layo
           if kill -s SIGHUP -- "${wl_pid}"; then
             printf '%s\n' "${FUNCNAME[0]}: INFO: Signal SIGHUP ok."
           else
-            printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. Sending signal SIGHUP failed. Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout."
+            printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. Sending signal SIGHUP failed. Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout." >&2
           fi
         else
-          printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. Not sending signal SIGHUP for account '${account_name}' to process 'labwc' pid '${wl_pid}' because it is not running. Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout."
+          printf '%s\n' "${FUNCNAME[0]}: WARNING: Minor issue. Not sending signal SIGHUP for account '${account_name}' to process 'labwc' pid '${wl_pid}' because it is not running. Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layout." >&2
         fi
       fi
     done
@@ -672,25 +627,8 @@ Reboot may be required to change the graphical (Wayland / 'labwc') keyboard layo
 ## Sets the system-wide keyboard layout for the console, greeter, and labwc
 ## sessions all at once.
 set_system_keymap() {
-  local args=("$@")
   local labwc_system_wide_config_dir labwc_system_wide_config_path \
     labwc_greeter_config_dir labwc_greeter_config_path
-
-  ## We must have at least one, but no more than three, arguments specifying the
-  ## keyboard layout(s).
-  if [ "${#args[@]}" = '0' ] || [ -z "${args[0]:-}" ] \
-    || (( ${#args[@]} > 3 )); then
-    ## The print_usage function is provided by the script that sources this
-    ## library.
-    print_usage
-    exit 1
-  fi
-
-  ## If we have less than three arguments, populate the `args` array with empty
-  ## strings for the remaining arguments.
-  while (( ${#args[@]} < 3 )); do
-    args+=( '' )
-  done
 
   labwc_system_wide_config_dir='/etc/xdg/labwc'
   labwc_system_wide_config_path="${labwc_system_wide_config_dir}/environment"
@@ -706,46 +644,49 @@ set_system_keymap() {
     return 1
   fi
 
-  set_console_keymap \
-    "${args[@]}" \
-    || return 1
+  set_console_keymap || return 1
   printf '%s\n' ""
 
   ## {{{ Set the specified keyboard layout for labwc both system-wide and for the greeter.
 
   printf '%s\n' "${FUNCNAME[0]}: INFO: 'labwc' configuration..."
 
-  labwc_config_path="${labwc_system_wide_config_path}" \
-    set_labwc_keymap \
-    "${args[@]}" \
-    || return 1
+  labwc_config_path="${labwc_system_wide_config_path}"
+  set_labwc_keymap || return 1
   printf '%s\n' ""
 
   printf '%s\n' "${FUNCNAME[0]}: INFO: 'greetd' configuration..."
-  labwc_config_path="${labwc_greeter_config_path}" \
-    set_labwc_keymap \
-    "${args[@]}" \
-    || return 1
+  labwc_config_path="${labwc_greeter_config_path}"
+  set_labwc_keymap || return 1
   printf '%s\n' ""
 
   ## }}}
 
-  set_grub_keymap \
-    "${args[@]}" \
-    || return 1
+  set_grub_keymap || return 1
   printf '%s\n' ""
 
-  kb_reload_root
+  labwc_kb_reload_root
   printf '%s\n' ""
 
+  ## Soft-fail.
   dracut_run
   printf '%s\n' ""
 
-  printf '%s\n' "${FUNCNAME[0]}: INFO: Keyboard layout change successful."
+  if [ "${exit_code:-0}" = 0 ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Keyboard layout change successful."
+    return 0
+  fi
+
+  printf '%s\n' "${FUNCNAME[0]}: WARNING: Keyboard layout changes applied, but some steps failed, see above."
 }
 
 rebuild_grub_config() {
   local update_grub_output
+
+  if [ "${do_live_changes}" = 'false' ]; then
+    printf '%s\n' "${FUNCNAME[0]}: INFO: Skipping command 'update-grub' due to '--no-live-changes' option."
+    return 0
+  fi
 
   if ischroot --default-false; then
     ## Inside chroot such as during image builds it may be best to leave running update-grub to the build tool.
@@ -770,38 +711,9 @@ rebuild_grub_config() {
 }
 
 set_grub_keymap() {
-  local args=("$@")
   local grub_kbdcomp_output name_part_list name_part
 
   printf '%s\n' "${FUNCNAME[0]}: INFO: GRUB keymap configuration..."
-
-  ## We must have at least one, but no more than three, arguments specifying the
-  ## keyboard layout(s).
-  if [ "${#args[@]}" = '0' ] || [ -z "${args[0]:-}" ] \
-    || (( ${#args[@]} > 3 )); then
-    ## The print_usage function is provided by the script that sources this
-    ## library.
-    print_usage
-    exit 1
-  fi
-
-  ## If we have less than three arguments, populate the `args` array with empty
-  ## strings for the remaining arguments.
-  while (( ${#args[@]} < 3 )); do
-    args+=( '' )
-  done
-
-  ## Interactive mode checks the layouts for us already, no need to do it
-  ## twice.
-  if [ "${skl_interactive}" = 'false' ]; then
-    check_keyboard_layouts "${args[0]}" || return 1
-    if [ -n "${args[1]:-}" ]; then
-      check_keyboard_layout_variants "${args[0]}" "${args[1]}" || return 1
-    fi
-    if [ -n "${args[2]:-}" ]; then
-      check_keyboard_layout_options "${args[2]}" || return 1
-    fi
-  fi
 
   if ! mkdir --parents -- "${grub_kb_layout_dir}"; then
     printf '%s\n' "${FUNCNAME[0]}: ERROR: Cannot create GRUB keyboard layout dir '${grub_kb_layout_dir}'!" >&2
@@ -824,7 +736,7 @@ set_grub_keymap() {
   if ! grub_kbdcomp_output="$(
     grub-kbdcomp -o "${grub_kb_layout_dir}/user-layout.gkb" "${args[@]}" 2>&1
   )"; then
-    printf '%s\n' "${FUNCNAME[0]}: ERROR: Failed to build GRUB keyboard layout!"
+    printf '%s\n' "${FUNCNAME[0]}: ERROR: Failed to build GRUB keyboard layout!" >&2
     printf '%s\n' "${FUNCNAME[0]}: Output from the 'grub-kbdcomp' command:" >&2
     printf '%s\n' "${grub_kbdcomp_output}" >&2
     return 1
@@ -846,7 +758,7 @@ set_grub_keymap() {
 }
 
 build_all_grub_keymaps() {
-  local keymap_list keymap old_keymap_file grub_kbdcomp_output
+  local keymap_list keymap old_keymap_file grub_kbdcomp_output old_nullglob
 
   if [ "${do_read_stdin}" = 'true' ]; then
     printf '%s\n' "${FUNCNAME[0]}: INFO: Getting list of keyboard layouts from 'stdin' (standard input)."
@@ -854,6 +766,11 @@ build_all_grub_keymaps() {
   else
     printf '%s\n' "${FUNCNAME[0]}: INFO: Getting list of available keyboard layouts from 'localectl-static'."
     readarray -t keymap_list <<< "${localectl_kb_layouts}"
+  fi
+
+  if (( ${#keymap_list[@]} == 0 )); then
+    printf '%s\n' "${FUNCNAME[0]}: ERROR: No keyboard layouts were provided to build!" >&2
+    return 1
   fi
 
   if ! mkdir --parents -- "${grub_kb_layout_dir}"; then
@@ -867,6 +784,8 @@ build_all_grub_keymaps() {
   fi
 
   printf '%s\n' "${FUNCNAME[0]}: INFO: Building keyboard layouts for GRUB."
+  old_nullglob="$(shopt -p nullglob || true)"
+  shopt -s nullglob
   for old_keymap_file in "${grub_kb_layout_dir}/"* ; do
     if ! [ -f "${old_keymap_file}" ]; then
       continue
@@ -877,6 +796,7 @@ build_all_grub_keymaps() {
     fi
     safe-rm -- "${old_keymap_file}"
   done
+  eval "${old_nullglob}"
   for keymap in "${keymap_list[@]}"; do
     if [ "${keymap}" = 'custom' ]; then
       continue
@@ -958,10 +878,8 @@ Alt+Shift the keyboard layout switch shortcut, specify
 "
 }
 
-## Scripts such as 'set-grub-keymap' etc. call function 'interactive_ui' directly.
 interactive_ui() {
-  local layout_str variant_str option_str \
-    variant_key_str
+  local layout_str variant_str option_str variant_key_str
 
   printf '%s\n' "\
 Type 'list' at any prompt to see a list of valid options.
@@ -1081,17 +999,27 @@ Type 'exit' to quit without changing keyboard layout settings.
     fi
   done
 
-  "${function_name}" \
-    "${layout_str}" \
-    "${variant_str}" \
-    "${option_str}" \
-    || return 1
+  ## global args
+  args=( "${layout_str}" "${variant_str}" "${option_str}" )
+
+  # shellcheck disable=SC2154
+  "${function_name}" || return 1
+}
+
+unknown_option_error() {
+  printf '%s\n' "parse_cmd: ERROR: Unknown option '$1'." >&2
+  print_usage
+  exit 1
 }
 
 parse_cmd() {
   while [ -n "${1:-}" ]; do
     case "$1" in
       '--no-persist')
+        if [ "${function_name}" != 'set_labwc_keymap' ]; then
+          printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--no-persist' is only supported by 'set-labwc-keymap'." >&2
+          exit 1
+        fi
         do_persist='false'
         shift
         ;;
@@ -1102,10 +1030,18 @@ parse_cmd() {
         exit 0
         ;;
       '--no-reload')
+        if [ "${function_name}" != 'set_labwc_keymap' ]; then
+          printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--no-reload' is only supported by 'set-labwc-keymap'." >&2
+          exit 1
+        fi
         no_reload='true'
         shift
         ;;
       '--config='*)
+        if [ "${function_name}" != 'set_labwc_keymap' ]; then
+          printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--config' is only supported by 'set-labwc-keymap'." >&2
+          exit 1
+        fi
         labwc_config_path="$(cut -d'=' -f2- <<< "$1")"
         if [ -z "$labwc_config_path" ]; then
           printf '%s\n' "${FUNCNAME[0]}: ERROR: No '--config=path' specified!" >&2
@@ -1118,15 +1054,31 @@ parse_cmd() {
         shift
         ;;
       '--no-update-grub')
+        if [ "${function_name}" != 'set_grub_keymap' ]; then
+          printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--no-update-grub' is only supported by 'set-grub-keymap'." >&2
+          exit 1
+        fi
         do_update_grub='false'
         shift
         ;;
       '--read-stdin')
+        if [ "${function_name}" != 'set_grub_keymap' ]; then
+          printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--read-stdin' is only supported by 'set-grub-keymap'." >&2
+          exit 1
+        fi
         do_read_stdin='true'
         shift
         ;;
       '--build-all')
+        if [ "${function_name}" != 'set_grub_keymap' ]; then
+          printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--build-all' is only supported by 'set-grub-keymap'." >&2
+          exit 1
+        fi
         do_build_all_grub_keymaps='true'
+        shift
+        ;;
+      '--no-live-changes')
+        do_live_changes='false'
         shift
         ;;
       '--')
@@ -1150,20 +1102,58 @@ parse_cmd() {
 
   ## Variable '$function_name' gets set by the calling script.
 
+  if [ "${do_read_stdin}" = 'true' ] && [ "${do_build_all_grub_keymaps}" != 'true' ]; then
+    printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--read-stdin' is only supported together with '--build-all'." >&2
+    exit 1
+  fi
+
   if [ "$do_build_all_grub_keymaps" = "true" ]; then
+    if (( ${#args[@]} > 0 )); then
+      printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--build-all' does not accept positional arguments." >&2
+      print_usage
+      exit 1
+    fi
+    if [ "${skl_interactive}" = "true" ]; then
+      printf '%s\n' "${FUNCNAME[0]}: ERROR: Option '--interactive' cannot be used with '--build-all'." >&2
+      print_usage
+      exit 1
+    fi
     ## Build all GRUB keymaps if requested.
     build_all_grub_keymaps "${args[@]}"
     exit 0
   fi
 
-  if [ "$skl_interactive" = "true" ]; then
+  if [ "${skl_interactive}" = "true" ]; then
     interactive_ui "${args[@]}"
     exit 0
   fi
 
+  ## We must have at least one, but no more than three, arguments specifying the
+  ## keyboard layout(s).
+  if [ "${#args[@]}" = '0' ] || [ -z "${args[0]:-}" ] \
+    || (( ${#args[@]} > 3 )); then
+    print_usage
+    exit 1
+  fi
+
+  ## If we have less than three arguments, populate the `args` array with empty
+  ## strings for the remaining arguments.
+  while (( ${#args[@]} < 3 )); do
+    args+=( '' )
+  done
+
+  ## Ensure keyboard setting validity before calling the
+  ## configuration function
+  check_keyboard_layouts "${args[0]}" || return 1
+  if [ -n "${args[1]:-}" ]; then
+    check_keyboard_layout_variants "${args[0]}" "${args[1]}" || return 1
+  fi
+  if [ -n "${args[2]:-}" ]; then
+    check_keyboard_layout_options "${args[2]}" || return 1
+  fi
+
   "$function_name" "${args[@]}"
 }
-
 ## Debugging.
 # ischroot() {
 #   true
@@ -1191,6 +1181,7 @@ command -v ischroot >/dev/null
 command -v jq >/dev/null
 command -v tr >/dev/null
 command -v loginctl >/dev/null
+command -v pgrep >/dev/null
 command -v /usr/libexec/helper-scripts/query-sock-pid >/dev/null
 command -v localectl-static >/dev/null
 
@@ -1208,9 +1199,9 @@ skl_default_keyboard_var_names=(
 )
 
 args=()
-kb_set_opts=()
-do_read_stdin='false'
 skl_interactive='false'
+do_live_changes='true'
+do_read_stdin='false'
 do_update_grub='true'
 do_persist='true'
 no_reload='false'
