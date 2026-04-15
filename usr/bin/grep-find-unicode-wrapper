@@ -5,6 +5,33 @@
 
 ## https://www.kicksecure.com/wiki/Unicode#grep-find-unicode-wrapper
 
+## Portability: this wrapper is GNU/Linux-only by design. It depends on
+## GNU grep ('--perl-regexp', '--files-with-matches', '--binary-files=text',
+## '--null', '--include=', '--exclude-dir=', ...), GNU sort
+## ('--zero-terminated'), and bash features ('shopt -s lastpipe',
+## '$'\''...'\''' ANSI-C quoting, 'printf %q', '${PIPESTATUS[@]}'). It is
+## not portable to POSIX sh, BSD grep, or busybox and is not intended to
+## be. 'command -v sort' / 'command -v grep' only verify presence, not
+## the specific GNU options relied on; on a non-GNU system the script
+## will fail loudly at the first grep invocation rather than silently
+## mis-detect.
+
+## POSIXLY_CORRECT disables GNU getopt's option permutation: once grep
+## sees a non-option argument, it treats every subsequent argument as
+## an operand even if it looks like an option. This wrapper's grep
+## invocations have the shape
+##
+##     grep [wrapper flags] --perl-regexp 'PATTERN' "$@"
+##
+## where 'PATTERN' is a positional argument. Under POSIXLY_CORRECT any
+## user option in "$@" (e.g. '-r', '--recursive', '--include=*.c')
+## would therefore be interpreted as a filename and grep would error
+## with "No such file or directory: --recursive". Unset the variable
+## so child grep processes inherit an environment without it. This is
+## safe for the wrapper itself because it is written in bash, not POSIX
+## sh, and does not rely on POSIX-mode semantics anywhere.
+unset POSIXLY_CORRECT
+
 set -o errexit
 set -o nounset
 set -o errtrace
@@ -87,10 +114,17 @@ for arg in "$@"; do
     -r|-R|--recursive|--dereference-recursive|-s|--no-messages)
       ## Bare allowed flags.
       ;;
-    -[rRs][rRs]|-[rRs][rRs][rRs])
-      ## Clustered combinations of the allowed short flags only
-      ## (e.g. '-rs', '-Rs', '-rRs'). Any cluster containing a letter
-      ## outside {r, R, s} falls through to the '-*' reject branch.
+    -[rRs]*)
+      ## Clustered short options starting with one of the allowed
+      ## letters. Verify via a regex that EVERY character in the
+      ## cluster is drawn from {r, R, s}; any cluster containing a
+      ## letter outside that set (e.g. '-rI', '-rv') falls through to
+      ## the '-*' reject branch below.
+      if [[ ! ${arg#-} =~ ^[rRs]+$ ]]; then
+        printf '%s\n' \
+          "$0: ERROR: refusing grep option '$arg': cluster contains a disallowed letter." >&2
+        exit 2
+      fi
       ;;
     --include=*|--exclude=*|--exclude-dir=*|--exclude-from=*)
       ## Long option with attached value.
@@ -118,17 +152,27 @@ if [ -n "$expect_value_for" ]; then
   exit 2
 fi
 
-## --binary-files=text - required to find backspace and null character
-## --null - write a NUL byte (not a newline) after each matching filename.
-## Required to survive filenames that contain embedded newlines: with the
-## default newline separator, a path like $'evil\nfile.txt' is split across
-## two output lines and a downstream 'sort --unique' would treat the halves
-## as independent records, mangling the filename list. NUL-delimited output
-## combined with 'sort --zero-terminated' keeps one record per filename
-## regardless of what bytes the filename contains.
+## --files-with-matches / -l  only the filename is emitted per match, not
+##   the matching line; combined with '--null' this is the wrapper's
+##   record format.
+## --binary-files=text         required to find backspace and null bytes;
+##   without it grep classifies files with NULs as binary and
+##   short-circuits with a "Binary file … matches" summary instead of
+##   running the pattern.
+## --null / -Z                 write a NUL byte (not a newline) after each
+##   matching filename. Required to survive filenames that contain
+##   embedded newlines: with the default newline separator, a path like
+##   $'evil\nfile.txt' is split across two output lines and a downstream
+##   'sort --unique' would treat the halves as independent records,
+##   mangling the filename list. NUL-delimited output combined with
+##   'sort --zero-terminated' keeps one record per filename regardless of
+##   what bytes the filename contains.
+##
+## '--line-number' is intentionally omitted: with '--files-with-matches'
+## grep prints only the filename per match, not the matching line, so
+## '--line-number' would have no effect and only serves as dead weight.
 grep_args=(
   --files-with-matches
-  --line-number
   --binary-files=text
   --null
 )
