@@ -21,8 +21,8 @@ check_grep_status() {
   fi
 }
 
-command -v stecho >/dev/null
 command -v sort >/dev/null
+command -v mktemp >/dev/null
 
 ## end-of-options ("--"):
 ## There is intentionally not use of end-of-options, because this a wrapper
@@ -67,18 +67,40 @@ for arg in "$@"; do
 done
 
 ## --binary-files=text - required to find backspace and null character
+## --null - write a NUL byte (not a newline) after each matching filename.
+## Required to survive filenames that contain embedded newlines: with the
+## default newline separator, a path like $'evil\nfile.txt' is split across
+## two output lines and a downstream 'sort --unique' would treat the halves
+## as independent records, mangling the filename list. NUL-delimited output
+## combined with 'sort --zero-terminated' keeps one record per filename
+## regardless of what bytes the filename contains.
 grep_args=(
   --files-with-matches
   --line-number
   --binary-files=text
+  --null
 )
+
+## Collect each pass's NUL-delimited filename list into a temporary file.
+## Previous versions captured output with command substitution ("$(...)"),
+## which (a) strips embedded NUL bytes unconditionally -- so the '--null'
+## separators above would be silently eaten and all filenames would be
+## concatenated into a single record -- and (b) cannot hold NUL-delimited
+## data in a bash string in the first place. Writing to files avoids both
+## problems and keeps error codes per pass so 'check_grep_status' still
+## distinguishes "no match" (1) from "grep error" (>=2).
+tmp_dir="$(mktemp --directory)"
+# shellcheck disable=SC2064
+trap "rm -rf -- ${tmp_dir@Q}" EXIT
 
 set +o errexit
 
-one="$(LC_ALL=C grep "${grep_args[@]}" --perl-regexp '[^\x00-\x7F]' "$@")"
+LC_ALL=C grep "${grep_args[@]}" --perl-regexp '[^\x00-\x7F]' "$@" \
+  > "$tmp_dir/1"
 check_grep_status "$?"
 
-two="$(LC_ALL=C grep "${grep_args[@]}" --perl-regexp "[^[:ascii:]]" "$@")"
+LC_ALL=C grep "${grep_args[@]}" --perl-regexp "[^[:ascii:]]" "$@" \
+  > "$tmp_dir/2"
 check_grep_status "$?"
 
 ## https://access.redhat.com/security/vulnerabilities/RHSB-2021-007
@@ -100,7 +122,7 @@ check_grep_status "$?"
 ##
 ## sha512sum testfile
 ## 0196f0043f8a77fb1d757acae601b460026b02857341c3ec407fbf0a88471882eae5beaa517afebabc63fabe21c84d10a2a67f9655ea2026d9b9b8f61969f585
-three="$(LC_ALL=C grep "${grep_args[@]}" --fixed-strings \
+LC_ALL=C grep "${grep_args[@]}" --fixed-strings \
   -e $'\xD8\x9C' \
   -e $'\xE2\x80\x8E' \
   -e $'\xE2\x80\x8F' \
@@ -113,40 +135,45 @@ three="$(LC_ALL=C grep "${grep_args[@]}" --fixed-strings \
   -e $'\xE2\x81\xA7' \
   -e $'\xE2\x81\xA8' \
   -e $'\xE2\x81\xA9' \
-  "$@")"
+  "$@" \
+  > "$tmp_dir/3"
 check_grep_status "$?"
 
 ## ASCII control characters.
-four="$(LC_ALL=C grep "${grep_args[@]}" --perl-regexp '[\x00-\x08\x0B\x0C\x0D\x0E-\x1F\x7F]' "$@")"
+LC_ALL=C grep "${grep_args[@]}" \
+  --perl-regexp '[\x00-\x08\x0B\x0C\x0D\x0E-\x1F\x7F]' "$@" \
+  > "$tmp_dir/4"
 check_grep_status "$?"
 
 set -o errexit
 
-#result="\
-#$one
-#$two
-#$three
-#$four"
-## Problem: Extraneous newline at the end.
-#output_message="$(printf '%s' "$result" | sort --unique)"
+## Merge, sort and de-duplicate in the NUL domain, then read the result
+## back into a bash array with 'read -d ""'. Each array element is exactly
+## one filename; no byte value (newline, tab, NUL-stripped-by-$(...), etc.)
+## can corrupt record boundaries any more.
+declare -a matches=()
+while IFS= read -r -d '' match_file; do
+  matches+=("$match_file")
+done < <(
+  LC_ALL=C sort --zero-terminated --unique \
+    "$tmp_dir/1" "$tmp_dir/2" "$tmp_dir/3" "$tmp_dir/4"
+)
 
-output_message="$(
-  {
-    [ -n "${one:-}"   ] && printf '%s\n' "$one"   || true
-    [ -n "${two:-}"   ] && printf '%s\n' "$two"   || true
-    [ -n "${three:-}" ] && printf '%s\n' "$three" || true
-    [ -n "${four:-}"  ] && printf '%s\n' "$four"  || true
-  } | sort --unique
-)"
-
-if [ "$output_message" = "" ]; then
+if [ "${#matches[@]}" -eq 0 ]; then
   ## No matches found, therefore 'exit 1'.
   ## This is consistent with 'grep', which also exits non-zero if no match has been found.
   exit 1
 fi
 
-## Use 'stecho' in case the file names itself contain unicode.
-stecho "$output_message"
+## Print one filename per line, shell-quoted. 'printf %q' is used instead
+## of plain echo/stecho so that filenames containing newlines, tabs, or
+## other control bytes remain on a single output line (emitted as a $'...'
+## literal), preserving the "one line = one file" contract that downstream
+## shell pipelines rely on. Ordinary filenames with no special characters
+## are printed verbatim, so existing callers see no visible change.
+for match_file in "${matches[@]}"; do
+  printf '%q\n' "$match_file"
+done
 
 ## Matches found, therefore 'exit 0'.
 ## This is consistent with 'grep', which also exits 0 if matches have been found.
