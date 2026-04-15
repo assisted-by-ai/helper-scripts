@@ -178,16 +178,26 @@ fi
 ## De-duplicate and sort the accumulated filenames without temp files.
 ## Each filename is re-emitted NUL-terminated via 'printf %s\0' so that
 ## embedded newlines/tabs/etc. survive the sort, then the final print
-## loop formats each record with 'printf %q\n'. 'printf %q' is used so
-## that filenames containing newlines, tabs, or other control bytes
-## remain on a single output line (emitted as a $'...' literal),
-## preserving the "one line = one file" contract that downstream shell
-## pipelines rely on. Ordinary filenames with no special characters are
-## printed verbatim, so existing callers see no visible change.
+## loop formats each record. Filenames that contain an ASCII control
+## byte (newline, tab, ESC, DEL, ...) would corrupt the "one line =
+## one file" contract or inject terminal escapes, so those are printed
+## with 'printf %q\n' as a $'...' literal. Filenames without control
+## bytes -- including ordinary UTF-8 names like 'café.txt' -- are
+## printed verbatim with 'printf %s\n', matching the previous output
+## format for the common case. LC_ALL=C makes the [[:cntrl:]] class
+## byte-based so the decision is not locale-sensitive.
+export LC_ALL=C
 printf '%s\0' "${matches[@]}" \
-  | LC_ALL=C sort --zero-terminated --unique \
+  | sort --zero-terminated --unique \
   | while IFS= read -r -d '' match_file; do
-      printf '%q\n' "$match_file"
+      case $match_file in
+        *[[:cntrl:]]*)
+          printf '%q\n' "$match_file"
+          ;;
+        *)
+          printf '%s\n' "$match_file"
+          ;;
+      esac
     done
 
 ## Matches found, therefore 'exit 0'.
