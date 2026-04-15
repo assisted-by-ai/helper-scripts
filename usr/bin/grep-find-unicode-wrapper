@@ -22,7 +22,6 @@ check_grep_status() {
 }
 
 command -v sort >/dev/null
-command -v mktemp >/dev/null
 
 ## end-of-options ("--"):
 ## There is intentionally not use of end-of-options, because this a wrapper
@@ -81,27 +80,50 @@ grep_args=(
   --null
 )
 
-## Collect each pass's NUL-delimited filename list into a temporary file.
-## Previous versions captured output with command substitution ("$(...)"),
-## which (a) strips embedded NUL bytes unconditionally -- so the '--null'
-## separators above would be silently eaten and all filenames would be
-## concatenated into a single record -- and (b) cannot hold NUL-delimited
-## data in a bash string in the first place. Writing to files avoids both
-## problems and keeps error codes per pass so 'check_grep_status' still
-## distinguishes "no match" (1) from "grep error" (>=2).
-tmp_dir="$(mktemp --directory)"
-# shellcheck disable=SC2064
-trap "rm -rf -- ${tmp_dir@Q}" EXIT
+## Collect each pass's filenames directly into a bash array, without
+## command substitution and without temporary files.
+##
+## Previous versions captured output with "$(grep ...)". Two problems:
+##   (a) bash command substitution unconditionally strips embedded NUL
+##       bytes, so '--null' separators are eaten and all filenames
+##       concatenate into a single record;
+##   (b) newline-separated output corrupts filenames that contain '\n'.
+##
+## The fix is a plain pipeline
+##
+##     grep ... | collect_matches
+##
+## where 'collect_matches' is a bash function that does
+##   'while IFS= read -r -d "" f; do matches+=("$f"); done'.
+##
+## Normally the right-hand side of a pipe runs in a subshell and any
+## array mutation would be lost. 'shopt -s lastpipe' (combined with job
+## control turned off via 'set +m', which is the default in scripts
+## anyway but is set explicitly for safety) makes the *last* command of
+## a pipeline run in the current shell, so 'matches+=(...)' persists.
+## '${PIPESTATUS[0]}' still gives us grep's exit code, so
+## 'check_grep_status' continues to distinguish "no match" (1) from
+## "grep error" (>=2).
+set +m
+shopt -s lastpipe
+
+declare -a matches=()
+collect_matches() {
+  local match_file
+  while IFS= read -r -d '' match_file; do
+    matches+=("$match_file")
+  done
+}
 
 set +o errexit
 
 LC_ALL=C grep "${grep_args[@]}" --perl-regexp '[^\x00-\x7F]' "$@" \
-  > "$tmp_dir/1"
-check_grep_status "$?"
+  | collect_matches
+check_grep_status "${PIPESTATUS[0]}"
 
 LC_ALL=C grep "${grep_args[@]}" --perl-regexp "[^[:ascii:]]" "$@" \
-  > "$tmp_dir/2"
-check_grep_status "$?"
+  | collect_matches
+check_grep_status "${PIPESTATUS[0]}"
 
 ## https://access.redhat.com/security/vulnerabilities/RHSB-2021-007
 ## https://lintian.debian.org/tags/unicode-trojan
@@ -136,28 +158,16 @@ LC_ALL=C grep "${grep_args[@]}" --fixed-strings \
   -e $'\xE2\x81\xA8' \
   -e $'\xE2\x81\xA9' \
   "$@" \
-  > "$tmp_dir/3"
-check_grep_status "$?"
+  | collect_matches
+check_grep_status "${PIPESTATUS[0]}"
 
 ## ASCII control characters.
 LC_ALL=C grep "${grep_args[@]}" \
   --perl-regexp '[\x00-\x08\x0B\x0C\x0D\x0E-\x1F\x7F]' "$@" \
-  > "$tmp_dir/4"
-check_grep_status "$?"
+  | collect_matches
+check_grep_status "${PIPESTATUS[0]}"
 
 set -o errexit
-
-## Merge, sort and de-duplicate in the NUL domain, then read the result
-## back into a bash array with 'read -d ""'. Each array element is exactly
-## one filename; no byte value (newline, tab, NUL-stripped-by-$(...), etc.)
-## can corrupt record boundaries any more.
-declare -a matches=()
-while IFS= read -r -d '' match_file; do
-  matches+=("$match_file")
-done < <(
-  LC_ALL=C sort --zero-terminated --unique \
-    "$tmp_dir/1" "$tmp_dir/2" "$tmp_dir/3" "$tmp_dir/4"
-)
 
 if [ "${#matches[@]}" -eq 0 ]; then
   ## No matches found, therefore 'exit 1'.
@@ -165,15 +175,20 @@ if [ "${#matches[@]}" -eq 0 ]; then
   exit 1
 fi
 
-## Print one filename per line, shell-quoted. 'printf %q' is used instead
-## of plain echo/stecho so that filenames containing newlines, tabs, or
-## other control bytes remain on a single output line (emitted as a $'...'
-## literal), preserving the "one line = one file" contract that downstream
-## shell pipelines rely on. Ordinary filenames with no special characters
-## are printed verbatim, so existing callers see no visible change.
-for match_file in "${matches[@]}"; do
-  printf '%q\n' "$match_file"
-done
+## De-duplicate and sort the accumulated filenames without temp files.
+## Each filename is re-emitted NUL-terminated via 'printf %s\0' so that
+## embedded newlines/tabs/etc. survive the sort, then the final print
+## loop formats each record with 'printf %q\n'. 'printf %q' is used so
+## that filenames containing newlines, tabs, or other control bytes
+## remain on a single output line (emitted as a $'...' literal),
+## preserving the "one line = one file" contract that downstream shell
+## pipelines rely on. Ordinary filenames with no special characters are
+## printed verbatim, so existing callers see no visible change.
+printf '%s\0' "${matches[@]}" \
+  | LC_ALL=C sort --zero-terminated --unique \
+  | while IFS= read -r -d '' match_file; do
+      printf '%q\n' "$match_file"
+    done
 
 ## Matches found, therefore 'exit 0'.
 ## This is consistent with 'grep', which also exits 0 if matches have been found.
