@@ -29,41 +29,94 @@ command -v sort >/dev/null
 ## options such as for example '--recursive'. It remains the responsibility of
 ## the user to use end-of-options.
 
-## Safeguard against user-supplied options that would defeat the wrapper:
-## grep's '-I' (alias '--binary-files=without-match') and '--binary-files=binary'
-## make grep skip any file it classifies as binary (e.g. any file containing a
-## NUL byte). Because user options are appended after the wrapper's own
-## '--binary-files=text' and grep honors the last occurrence, a caller passing
-## '-I' (or a clustered form such as '-rI') would silently hide hostile bytes
-## embedded in files with NULs. Refuse these options at the wrapper boundary.
-## Scanning stops at '--' so filenames following end-of-options are not
-## inspected. Clustered short-option detection is intentionally coarse (any
-## '-...I...' is rejected); this wrapper has no use for grep short options
-## that take in-cluster values such as '-eFOO', so false positives are
-## unlikely in practice.
+## Whitelist user-supplied grep options. Because the wrapper runs grep with
+## hard-coded semantics ('--files-with-matches --binary-files=text --null'
+## plus its own patterns), nearly any additional grep flag can break one of
+## those guarantees:
+##
+##   -q / --quiet               grep suppresses output but still exits 0 on
+##                              match, so the wrapper collects no filenames
+##                              and wrongly reports "no match" (exit 1).
+##   -L / --files-without-match flips '-l' and makes grep print CLEAN files
+##                              as matches -- massive false positives.
+##   -v / --invert-match        inverts the hard-coded patterns, so every
+##                              non-hostile file is reported.
+##   -m NUM (especially -m 0)   limits matches per file and, for small NUM,
+##                              can suppress legitimate matches.
+##   -c / --count               changes output format away from "filename
+##                              per record".
+##   -e PAT / -f FILE           add extra patterns, which either inject
+##                              false positives or shove the wrapper's own
+##                              positional pattern into the filename slot,
+##                              causing a grep argument-parse error.
+##   -I / --binary-files=...    overrides '--binary-files=text' so files
+##                              classified as binary (NUL-containing) are
+##                              silently skipped, hiding control bytes.
+##   -h / -H / --label= / -Z / --null-data / ...
+##                              change filename handling in ways that
+##                              invalidate the NUL-delimited parsing the
+##                              wrapper relies on.
+##
+## The safe set is therefore small. Allow only:
+##   * bare positional arguments (files and paths),
+##   * '--' end-of-options (and anything after it is positional),
+##   * recursion controls: -r, -R, --recursive, --dereference-recursive,
+##   * path filters: --include[=], --exclude[=], --exclude-dir[=],
+##                   --exclude-from[=],
+##   * -s / --no-messages (suppress "Permission denied" spam).
+##
+## Anything else is refused with a clear error. This is a whitelist on
+## purpose: blacklisting individual dangerous flags is unmaintainable
+## because grep's option surface is large and new dangerous flags can
+## appear in future grep versions.
+expect_value_for=""
 for arg in "$@"; do
+  if [ -n "$expect_value_for" ]; then
+    ## Previous iteration saw a space-separated long option that takes
+    ## a value (e.g. '--include PATTERN'); accept this arg as its value
+    ## regardless of what it looks like.
+    expect_value_for=""
+    continue
+  fi
   case "$arg" in
     --)
+      ## End-of-options: every remaining argument is positional. Stop
+      ## validating.
       break
       ;;
-    --binary-files=without-match|--binary-files=binary)
-      printf '%s\n' "$0: ERROR: refusing option '$arg': would defeat unicode detection." >&2
+    -r|-R|--recursive|--dereference-recursive|-s|--no-messages)
+      ## Bare allowed flags.
+      ;;
+    -[rRs][rRs]|-[rRs][rRs][rRs])
+      ## Clustered combinations of the allowed short flags only
+      ## (e.g. '-rs', '-Rs', '-rRs'). Any cluster containing a letter
+      ## outside {r, R, s} falls through to the '-*' reject branch.
+      ;;
+    --include=*|--exclude=*|--exclude-dir=*|--exclude-from=*)
+      ## Long option with attached value.
+      ;;
+    --include|--exclude|--exclude-dir|--exclude-from)
+      ## Long option with space-separated value: consume next arg.
+      expect_value_for="$arg"
+      ;;
+    -*)
+      printf '%s\n' \
+        "$0: ERROR: refusing grep option '$arg': not on the wrapper's allowlist." \
+        "$0: Allowed: -r -R --recursive --dereference-recursive -s --no-messages" \
+        "$0: Allowed: --include[=] --exclude[=] --exclude-dir[=] --exclude-from[=] --" \
+        "$0: See the comment block above this check for the rationale." >&2
       exit 2
       ;;
-    -I)
-      printf '%s\n' "$0: ERROR: refusing option '-I': would defeat unicode detection." >&2
-      exit 2
-      ;;
-    --*)
-      ## other long options are fine
-      :
-      ;;
-    -*I*)
-      printf '%s\n' "$0: ERROR: refusing option '$arg' (contains '-I'): would defeat unicode detection." >&2
-      exit 2
+    *)
+      ## Bare positional (a file or directory path). Allowed.
       ;;
   esac
 done
+if [ -n "$expect_value_for" ]; then
+  printf '%s\n' \
+    "$0: ERROR: option '$expect_value_for' is missing its value." >&2
+  exit 2
+fi
 
 ## --binary-files=text - required to find backspace and null character
 ## --null - write a NUL byte (not a newline) after each matching filename.
