@@ -33,11 +33,6 @@
 # - CURL_OUT_FILE: Specifies the path to the output file for download. Mandatory.
 # - CURL_PRGRS_EXEC: Designates the command to execute for updating the progress bar.
 #   Last argument will be the number in percent. Optional.
-# - CURL_PRGRS_ALLOW_UNKNOWN_LENGTH: When set to "yes", tolerate responses
-#   that omit the Content-Length header (e.g. chunked transfer). The
-#   progress bar is suppressed and the strict size-equality checks are
-#   skipped, but CURL_PRGRS_MAX_FILE_SIZE_BYTES is still enforced.
-#   Default: "no".
 #
 # Authors:
 # - Sam Stephenson <sstephenson@gmail.com>
@@ -84,10 +79,14 @@ initialize_variables() {
   : "${CURL_PRGRS_MAX_FILE_SIZE_BYTES:=""}"
   : "${CURL_OUT_FILE:=""}"
   : "${CURL_PRGRS_EXEC:=""}"
-  : "${CURL_PRGRS_ALLOW_UNKNOWN_LENGTH:="no"}"
   : "${curl_prgrs_print_progress:="yes"}"
   percent_last=""
-  curl_prgrs_size_check_enabled="yes"
+  ## "yes" means the server-reported Content-Length is known and matches
+  ## what will be written to disk. Set to "no" when Content-Length is
+  ## missing or when transparent decompression makes the on-disk size
+  ## differ from the reported value. When "no", the progress bar and
+  ## the 114/115 size-equality checks are both skipped; the 81
+  ## max-filesize cap still applies.
   curl_prgrs_length_known="yes"
 
   has tput
@@ -274,18 +273,13 @@ print_progress() {
   percent_last="$percent"
 }
 
-## Tolerate a missing or non-numeric Content-Length only when the
-## caller opted in via CURL_PRGRS_ALLOW_UNKNOWN_LENGTH=yes (chunked
-## transfer, dynamic responses). Disables the progress bar and the
-## strict 114/115 size-equality checks; the 81 max-filesize cap still
-## bounds the download.
+## Tolerate a missing or non-numeric Content-Length (chunked transfer,
+## dynamic responses, some CDNs). Disables the progress bar and the
+## strict 114/115 size-equality checks since there is nothing to
+## compare against; the 81 max-filesize cap from
+## CURL_PRGRS_MAX_FILE_SIZE_BYTES still bounds the download.
 handle_unknown_content_length() {
-  if [ "$CURL_PRGRS_ALLOW_UNKNOWN_LENGTH" = "yes" ]; then
-    curl_prgrs_length_known="no"
-    curl_prgrs_size_check_enabled="no"
-  else
-    curl_exit 116
-  fi
+  curl_prgrs_length_known="no"
 }
 
 curl_exit() {
@@ -328,18 +322,18 @@ curl_download() {
         curl_exit 81
       fi
 
-      if [ "$curl_prgrs_size_check_enabled" = "yes" ]; then
+      if [ "$curl_prgrs_length_known" = "yes" ]; then
         true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
         true "curl_prgrs_content_length: $curl_prgrs_content_length"
         if [ "$size_file_downloaded_bytes" -gt "$curl_prgrs_content_length" ]; then
           curl_exit 114
         fi
-      fi
 
-      if [ "$curl_prgrs_print_progress" = "yes" ] && [ "$curl_prgrs_length_known" = "yes" ]; then
-        ## Need to print to stderr to avoid confusing the stdout output of this command.
-        #stecho "${BASH_SOURCE[0]} INFO: print_progress '$size_file_downloaded_bytes' '$curl_prgrs_content_length'" >&2
-        print_progress "$size_file_downloaded_bytes" "$curl_prgrs_content_length"
+        if [ "$curl_prgrs_print_progress" = "yes" ]; then
+          ## Need to print to stderr to avoid confusing the stdout output of this command.
+          #stecho "${BASH_SOURCE[0]} INFO: print_progress '$size_file_downloaded_bytes' '$curl_prgrs_content_length'" >&2
+          print_progress "$size_file_downloaded_bytes" "$curl_prgrs_content_length"
+        fi
       fi
     fi
 
@@ -353,7 +347,7 @@ curl_download() {
   ## curl already terminated.
 
   : "${size_file_downloaded_bytes:=""}"
-  if [ "$curl_prgrs_size_check_enabled" = "yes" ] \
+  if [ "$curl_prgrs_length_known" = "yes" ] \
      && is_whole_number "$size_file_downloaded_bytes" ; then
     true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
     true "curl_prgrs_content_length: $curl_prgrs_content_length"
@@ -372,10 +366,10 @@ curl_download() {
 ## Single pass over the user-supplied curl args:
 ## - builds header_arguments: a copy with body-writing and resume-related
 ##   flags stripped, safe to pass to a HEAD probe.
-## - sets curl_prgrs_size_check_enabled="no" if the user requested
-##   transparent decompression, since the on-disk size will then
-##   legitimately differ from the server-reported Content-Length and
-##   would otherwise produce spurious 114/115 mismatches.
+## - sets curl_prgrs_length_known="no" if the user requested transparent
+##   decompression, since the on-disk size will then legitimately differ
+##   from the server-reported Content-Length and would otherwise produce
+##   spurious 114/115 mismatches and a misleading progress bar.
 scan_curl_arguments() {
   local arg_item
   local arg_list=()
@@ -385,7 +379,7 @@ scan_curl_arguments() {
   for arg_item in "$@"; do
     case "$arg_item" in
       --compressed|--tr-encoding|--compressed-ssh)
-        curl_prgrs_size_check_enabled="no"
+        curl_prgrs_length_known="no"
         ;;
     esac
 
@@ -433,7 +427,7 @@ main() {
 #   done
   ## }}}
 
-  ## sets: header_arguments, curl_prgrs_size_check_enabled
+  ## sets: header_arguments, curl_prgrs_length_known
   scan_curl_arguments "$@"
 
   ## {{{ Debugging.
@@ -461,15 +455,16 @@ main() {
   ## CURL_OUT_FILE and
   ## --output "$header_file" to avoid overwriting files when using "--continue-at -".
   ## '--write-out' will echo.
-  ## curl_prgrs_size_check_enabled="no" for the HEAD probe: the
+  ## curl_prgrs_length_known="no" for the HEAD probe: the
   ## "expected_header_size" sentinel of 8000 is just a placeholder, not
   ## an actual prediction of header bytes, so the 114/115 size-equality
-  ## checks must not be applied. The 81 cap via maximum_http_header_size
-  ## still enforces an upper bound.
+  ## checks must not be applied and the progress bar must not be drawn.
+  ## The 81 cap via maximum_http_header_size still enforces an upper
+  ## bound.
   curl_prgrs_content_length="$(
     header_download="true" \
     curl_prgrs_content_length="$expected_header_size" \
-    curl_prgrs_size_check_enabled="no" \
+    curl_prgrs_length_known="no" \
     CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size" \
     CURL_PRGRS_EXEC="" \
     CURL_OUT_FILE="$header_file" \
