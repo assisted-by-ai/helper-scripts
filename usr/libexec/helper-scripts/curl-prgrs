@@ -33,6 +33,11 @@
 # - CURL_OUT_FILE: Specifies the path to the output file for download. Mandatory.
 # - CURL_PRGRS_EXEC: Designates the command to execute for updating the progress bar.
 #   Last argument will be the number in percent. Optional.
+# - CURL_PRGRS_ALLOW_UNKNOWN_LENGTH: When set to "yes", tolerate responses
+#   that omit the Content-Length header (e.g. chunked transfer). The
+#   progress bar is suppressed and the strict size-equality checks are
+#   skipped, but CURL_PRGRS_MAX_FILE_SIZE_BYTES is still enforced.
+#   Default: "no".
 #
 # Authors:
 # - Sam Stephenson <sstephenson@gmail.com>
@@ -58,6 +63,9 @@ source /usr/libexec/helper-scripts/progress-bar
 ## provides: is_whole_number
 source /usr/libexec/helper-scripts/strings.bsh
 
+## provides: has
+source /usr/libexec/helper-scripts/has.sh
+
 initialize_terminal() {
   # We want to print the progress bar to stderr, but only if stderr is a
   # terminal. To avoid a conditional every time we print something, we can
@@ -72,17 +80,20 @@ initialize_terminal() {
 }
 
 initialize_variables() {
-  command -v tput >/dev/null
-  command -v curl >/dev/null
-  command -v safe-rm >/dev/null
-  command -v mktemp >/dev/null
-
   : "${CURL:="curl"}"
   : "${CURL_PRGRS_MAX_FILE_SIZE_BYTES:=""}"
   : "${CURL_OUT_FILE:=""}"
   : "${CURL_PRGRS_EXEC:=""}"
+  : "${CURL_PRGRS_ALLOW_UNKNOWN_LENGTH:="no"}"
   : "${curl_prgrs_print_progress:="yes"}"
   percent_last=""
+  curl_prgrs_size_check_enabled="yes"
+  curl_prgrs_length_known="yes"
+
+  has tput
+  has "$CURL"
+  has safe-rm
+  has mktemp
 
   temp_dir_auto_generated=true
   temporary_directory="$(mktemp --directory)"
@@ -117,13 +128,11 @@ check_variables() {
 shutdown() {
   local exit_code="$?"
   local signal="$1"
-  local last_err="$BASH_COMMAND"
   if [ "$signal" = "err" ]; then
     stecho "${BASH_SOURCE[0]} ERROR: Signal $signal received. Exiting." >&4
     stecho "${BASH_SOURCE[0]} ERROR: BASH_COMMAND '$BASH_COMMAND' exit code '$exit_code'." >&4
-    error_exit_code=110
   elif [ "$signal" = "exit" ]; then
-    true "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting." >&4
+    true "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting."
   else
     stecho "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting." >&4
   fi
@@ -137,7 +146,7 @@ shutdown() {
 
   local status
 
-  if [ -f "$statusfile" ]; then
+  if [ -n "${statusfile-}" ] && [ -f "$statusfile" ]; then
     true "${BASH_SOURCE[0]} INFO: got status file"
     status="$(stcat "$statusfile")"
     if ! is_whole_number "$status"; then
@@ -151,6 +160,14 @@ shutdown() {
     error_exit_code="112"
   fi
 
+  ## On ERR, prefer the specific status that curl_exit wrote to the
+  ## statusfile (e.g. 81, 114, 115, 116, or any genuine curl code).
+  ## Only fall back to the generic 110 when nothing more specific was
+  ## recorded, so callers can distinguish the failure cause.
+  if [ "$signal" = "err" ] && [ -z "${error_exit_code-}" ] && [ "$status" = "0" ]; then
+    error_exit_code=110
+  fi
+
   # If we are exiting normally, jump back to the beginning of the line
   # and clear it. Otherwise, print a newline.
   if [ "$status" -eq 0 ]; then
@@ -162,11 +179,18 @@ shutdown() {
   #stat="$(stcat "$statusfile")"
   #stecho "$stat" >&4
 
-  if [ "$temp_dir_auto_generated" = "true" ]; then
-    safe-rm -r -f -- "$temporary_directory"
+  ## Only the original shell should clean up the temp dir. If shutdown
+  ## runs inside a backgrounded subshell (BASHPID != $$), removing the
+  ## statusfile here would leave the parent with no way to recover the
+  ## specific exit code written by curl_exit. Defaults guard the case
+  ## where shutdown fires before initialize_variables completed.
+  if [ "$BASHPID" = "$$" ]; then
+    if [ "${temp_dir_auto_generated-}" = "true" ] \
+       && [ -n "${temporary_directory-}" ]; then
+      safe-rm -r -f -- "$temporary_directory"
+    fi
   fi
 
-  true curl_pid
   : "${curl_pid:=""}"
 
   processes_list="$curl_pid"
@@ -213,12 +237,17 @@ print_progress() {
   # progress bar. (This helps avoid a flicker when following redirects.)
   #[ "$length" -gt 8192 ] || return 0
 
+  # Avoid division by zero when the server reports Content-Length: 0.
+  if [ "$length" -le 0 ]; then
+    return 0
+  fi
+
   # Calculate the progress percentage and the size of the filled and
   # unfilled portions of the progress bar.
   local percent
   true "${BASH_SOURCE[0]} INFO: bytes: '$bytes'"
   true "${BASH_SOURCE[0]} INFO: length: '$length'"
-  percent=$(( $bytes * 100 / $length ))
+  percent=$(( bytes * 100 / length ))
 
   if ! is_whole_number "$percent" ; then
     curl_exit 113
@@ -245,6 +274,20 @@ print_progress() {
   percent_last="$percent"
 }
 
+## Tolerate a missing or non-numeric Content-Length only when the
+## caller opted in via CURL_PRGRS_ALLOW_UNKNOWN_LENGTH=yes (chunked
+## transfer, dynamic responses). Disables the progress bar and the
+## strict 114/115 size-equality checks; the 81 max-filesize cap still
+## bounds the download.
+handle_unknown_content_length() {
+  if [ "$CURL_PRGRS_ALLOW_UNKNOWN_LENGTH" = "yes" ]; then
+    curl_prgrs_length_known="no"
+    curl_prgrs_size_check_enabled="no"
+  else
+    curl_exit 116
+  fi
+}
+
 curl_exit() {
   curl_exit_code="$1"
   true "${BASH_SOURCE[0]} INFO: write $curl_exit_code to $statusfile"
@@ -267,11 +310,8 @@ curl_download() {
   $CURL --no-progress-meter "$@" &
   curl_pid="$!"
 
-  ## Additional validation.
-  ## Already validated earlier, but:
-  ## /usr/libexec/helper-scripts/curl-prgrs: line 266: [: : integer expression expected
   if ! is_whole_number "$curl_prgrs_content_length" ; then
-    curl_exit 116
+    handle_unknown_content_length
   fi
 
   while true ; do
@@ -288,13 +328,15 @@ curl_download() {
         curl_exit 81
       fi
 
-      true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
-      true "curl_prgrs_content_length: $curl_prgrs_content_length"
-      if [ "$size_file_downloaded_bytes" -gt "$curl_prgrs_content_length" ]; then
-        curl_exit 114
+      if [ "$curl_prgrs_size_check_enabled" = "yes" ]; then
+        true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
+        true "curl_prgrs_content_length: $curl_prgrs_content_length"
+        if [ "$size_file_downloaded_bytes" -gt "$curl_prgrs_content_length" ]; then
+          curl_exit 114
+        fi
       fi
 
-      if [ "$curl_prgrs_print_progress" = "yes" ]; then
+      if [ "$curl_prgrs_print_progress" = "yes" ] && [ "$curl_prgrs_length_known" = "yes" ]; then
         ## Need to print to stderr to avoid confusing the stdout output of this command.
         #stecho "${BASH_SOURCE[0]} INFO: print_progress '$size_file_downloaded_bytes' '$curl_prgrs_content_length'" >&2
         print_progress "$size_file_downloaded_bytes" "$curl_prgrs_content_length"
@@ -311,7 +353,8 @@ curl_download() {
   ## curl already terminated.
 
   : "${size_file_downloaded_bytes:=""}"
-  if is_whole_number "$size_file_downloaded_bytes" ; then
+  if [ "$curl_prgrs_size_check_enabled" = "yes" ] \
+     && is_whole_number "$size_file_downloaded_bytes" ; then
     true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
     true "curl_prgrs_content_length: $curl_prgrs_content_length"
     if [ "$header_download" = "false" ]; then
@@ -326,35 +369,47 @@ curl_download() {
   curl_exit "$curl_exit_code"
 }
 
-remove_argument_for_header_request() {
+## Single pass over the user-supplied curl args:
+## - builds header_arguments: a copy with body-writing and resume-related
+##   flags stripped, safe to pass to a HEAD probe.
+## - sets curl_prgrs_size_check_enabled="no" if the user requested
+##   transparent decompression, since the on-disk size will then
+##   legitimately differ from the server-reported Content-Length and
+##   would otherwise produce spurious 114/115 mismatches.
+scan_curl_arguments() {
   local arg_item
   local arg_list=()
   local skip_next=false
   header_arguments=()
 
   for arg_item in "$@"; do
+    case "$arg_item" in
+      --compressed|--tr-encoding|--compressed-ssh)
+        curl_prgrs_size_check_enabled="no"
+        ;;
+    esac
+
     if [ "$skip_next" = true ]; then
       skip_next=false
       continue
     fi
 
-    if [ "$arg_item" = "--continue-at" ]; then
-      skip_next=true
-      continue
-    fi
-    if [ "$arg_item" = "-C" ]; then
-      skip_next=true
-      continue
-    fi
-
-    if [ "$arg_item" = "--output" ]; then
-      skip_next=true
-      continue
-    fi
-    if [ "$arg_item" = "-o" ]; then
-      skip_next=true
-      continue
-    fi
+    case "$arg_item" in
+      --continue-at|-C|--output|-o)
+        skip_next=true
+        continue
+        ;;
+      --continue-at=*|--output=*)
+        continue
+        ;;
+      ## -O/--remote-name and -J/--remote-header-name would otherwise
+      ## cause curl to write the response body to a filename derived
+      ## from the URL or Content-Disposition header during the HEAD
+      ## probe.
+      -O|--remote-name|-J|--remote-header-name|--remote-name-all)
+        continue
+        ;;
+    esac
 
     arg_list+=("$arg_item")
   done
@@ -378,8 +433,8 @@ main() {
 #   done
   ## }}}
 
-  ## sets: header_arguments
-  remove_argument_for_header_request "${@}"
+  ## sets: header_arguments, curl_prgrs_size_check_enabled
+  scan_curl_arguments "$@"
 
   ## {{{ Debugging.
 #   printf '%s\n' ""
@@ -406,9 +461,15 @@ main() {
   ## CURL_OUT_FILE and
   ## --output "$header_file" to avoid overwriting files when using "--continue-at -".
   ## '--write-out' will echo.
+  ## curl_prgrs_size_check_enabled="no" for the HEAD probe: the
+  ## "expected_header_size" sentinel of 8000 is just a placeholder, not
+  ## an actual prediction of header bytes, so the 114/115 size-equality
+  ## checks must not be applied. The 81 cap via maximum_http_header_size
+  ## still enforces an upper bound.
   curl_prgrs_content_length="$(
     header_download="true" \
     curl_prgrs_content_length="$expected_header_size" \
+    curl_prgrs_size_check_enabled="no" \
     CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size" \
     CURL_PRGRS_EXEC="" \
     CURL_OUT_FILE="$header_file" \
@@ -425,7 +486,7 @@ main() {
   true "${BASH_SOURCE[0]} INFO: Header download done."
 
   if ! is_whole_number "$curl_prgrs_content_length" ; then
-    curl_exit 116
+    handle_unknown_content_length
   fi
 
   true "${BASH_SOURCE[0]} INFO: Download file..."
@@ -441,8 +502,11 @@ main() {
   exit "$wait_exit_code"
 }
 
-traps_enable
+## FD 4 must be opened before traps are installed: the shutdown handler
+## writes diagnostics to >&4, and an early failure before
+## initialize_terminal would otherwise hit "Bad file descriptor".
 initialize_terminal
+traps_enable
 initialize_variables
 check_variables
 main "$@"
