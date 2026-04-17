@@ -89,12 +89,12 @@ initialize_variables() {
   ## max-filesize cap still applies.
   curl_prgrs_length_known="yes"
 
-  has tput
   has "$CURL"
   has safe-rm
   has mktemp
+  has stecho
+  has stcat
 
-  temp_dir_auto_generated=true
   temporary_directory="$(mktemp --directory)"
 
   # Compute names for our temporary files by joining the current date and
@@ -102,6 +102,12 @@ initialize_variables() {
   # for reading progress information from curl, and another for sending the
   # exit status of curl from the forked child process back to the parent.
   statusfile="${temporary_directory}/status"
+
+  ## curl's PID is set in the backgrounded curl_download subshell and
+  ## does not propagate back to the parent. The subshell writes it here
+  ## so that the parent's shutdown handler can kill curl directly on
+  ## SIGTERM/SIGINT/SIGHUP rather than orphaning it.
+  curl_pidfile="${temporary_directory}/curl.pid"
 
   expected_header_size=8000
   maximum_http_header_size=32000
@@ -159,12 +165,18 @@ shutdown() {
     error_exit_code="112"
   fi
 
-  ## On ERR, prefer the specific status that curl_exit wrote to the
-  ## statusfile (e.g. 81, 114, 115, 116, or any genuine curl code).
-  ## Only fall back to the generic 110 when nothing more specific was
-  ## recorded, so callers can distinguish the failure cause.
-  if [ "$signal" = "err" ] && [ -z "${error_exit_code-}" ] && [ "$status" = "0" ]; then
-    error_exit_code=110
+  ## Prefer the specific status that curl_exit wrote to the statusfile
+  ## (e.g. 81, 114, 115, any genuine curl code). Only derive an exit
+  ## code from the signal itself when nothing specific was recorded —
+  ## otherwise a SIGTERM arriving mid-download would inherit the stale
+  ## 0 written by the preceding HEAD probe.
+  if [ -z "${error_exit_code-}" ] && [ "$status" = "0" ]; then
+    case "$signal" in
+      err)     error_exit_code=110 ;;
+      sigint)  error_exit_code=130 ;;
+      sigterm) error_exit_code=143 ;;
+      sighup)  error_exit_code=129 ;;
+    esac
   fi
 
   # If we are exiting normally, jump back to the beginning of the line
@@ -178,27 +190,39 @@ shutdown() {
   #stat="$(stcat "$statusfile")"
   #stecho "$stat" >&4
 
-  ## Only the original shell should clean up the temp dir. If shutdown
-  ## runs inside a backgrounded subshell (BASHPID != $$), removing the
-  ## statusfile here would leave the parent with no way to recover the
-  ## specific exit code written by curl_exit. Defaults guard the case
-  ## where shutdown fires before initialize_variables completed.
-  if [ "$BASHPID" = "$$" ]; then
-    if [ "${temp_dir_auto_generated-}" = "true" ] \
-       && [ -n "${temporary_directory-}" ]; then
-      safe-rm -r -f -- "$temporary_directory"
+  ## Recover curl's PID from the shared pidfile: when shutdown runs in
+  ## the parent shell, the local curl_pid is unset (it was assigned
+  ## inside the backgrounded curl_download subshell). Without this,
+  ## SIGTERM to the script would orphan the running curl process.
+  local curl_pid_from_file=""
+  if [ -n "${curl_pidfile-}" ] && [ -f "$curl_pidfile" ]; then
+    curl_pid_from_file="$(stcat "$curl_pidfile")"
+    if ! is_whole_number "$curl_pid_from_file"; then
+      curl_pid_from_file=""
     fi
   fi
 
   : "${curl_pid:=""}"
+  : "${curl_download_pid:=""}"
 
-  processes_list="$curl_pid"
+  processes_list="$curl_pid $curl_pid_from_file $curl_download_pid"
   for processes_item in $processes_list ; do
     if kill -0 -- "$processes_item" 2>/dev/null ; then
       #ps -p "$processes_item" || true
       kill -s sigkill -- "$processes_item" &>/dev/null || true
     fi
   done
+
+  ## Only the original shell should clean up the temp dir. If shutdown
+  ## runs inside a backgrounded subshell (BASHPID != $$), removing the
+  ## statusfile here would leave the parent with no way to recover the
+  ## specific exit code written by curl_exit. Cleanup runs after the
+  ## kill step so we can read curl_pidfile first.
+  if [ "$BASHPID" = "$$" ]; then
+    if [ -n "${temporary_directory-}" ]; then
+      safe-rm -r -f -- "$temporary_directory"
+    fi
+  fi
 
   if [ -n "${error_exit_code-}" ]; then
      true "${BASH_SOURCE[0]} INFO: exit with error_exit_code $error_exit_code"
@@ -298,11 +322,29 @@ curl_exit() {
   return "$curl_exit_code"
 }
 
+## Stat the output file and enforce the max-filesize cap. Used both
+## inside the polling loop and once more after curl exits, so a fast
+## completion that slips between poll iterations cannot evade the TUF
+## endless-data mitigation.
+enforce_max_filesize() {
+  if [ ! -f "$CURL_OUT_FILE" ]; then
+    return 0
+  fi
+  size_file_downloaded_bytes="$(stat -c "%s" "$CURL_OUT_FILE")"
+  if ! is_whole_number "$size_file_downloaded_bytes" ; then
+    curl_exit 113
+  fi
+  if [ "$size_file_downloaded_bytes" -gt "$CURL_PRGRS_MAX_FILE_SIZE_BYTES" ]; then
+    curl_exit 81
+  fi
+}
+
 curl_download() {
   local size_file_downloaded_bytes
 
   $CURL --no-progress-meter "$@" &
   curl_pid="$!"
+  stecho "$curl_pid" > "$curl_pidfile"
 
   if ! is_whole_number "$curl_prgrs_content_length" ; then
     handle_unknown_content_length
@@ -310,17 +352,7 @@ curl_download() {
 
   while true ; do
     if [ -f "$CURL_OUT_FILE" ]; then
-      size_file_downloaded_bytes="$(stat -c "%s" "$CURL_OUT_FILE")"
-
-      if ! is_whole_number "$size_file_downloaded_bytes" ; then
-        curl_exit 113
-      fi
-
-      true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
-      true "CURL_PRGRS_MAX_FILE_SIZE_BYTES: $CURL_PRGRS_MAX_FILE_SIZE_BYTES"
-      if [ "$size_file_downloaded_bytes" -gt "$CURL_PRGRS_MAX_FILE_SIZE_BYTES" ]; then
-        curl_exit 81
-      fi
+      enforce_max_filesize
 
       if [ "$curl_prgrs_length_known" = "yes" ]; then
         true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
@@ -344,7 +376,10 @@ curl_download() {
     sleep 1
   done
 
-  ## curl already terminated.
+  ## curl already terminated. Recheck the max-filesize cap on the final
+  ## file: the loop body may have run zero times or may have missed
+  ## bytes written in the final burst before curl exited.
+  enforce_max_filesize
 
   : "${size_file_downloaded_bytes:=""}"
   if [ "$curl_prgrs_length_known" = "yes" ] \
@@ -389,6 +424,7 @@ scan_curl_arguments() {
     fi
 
     case "$arg_item" in
+      ## Options that take a value as the next argument.
       --continue-at|-C|--output|-o)
         skip_next=true
         continue
@@ -401,6 +437,21 @@ scan_curl_arguments() {
       ## from the URL or Content-Disposition header during the HEAD
       ## probe.
       -O|--remote-name|-J|--remote-header-name|--remote-name-all)
+        continue
+        ;;
+      ## Body-writing / method-changing flags. A HEAD probe must not
+      ## send a request body, and -X/--request would override the
+      ## --head we add. Strip the flag and its value.
+      -d|--data|--data-ascii|--data-binary|--data-urlencode|--data-raw|-F|--form|--form-string|-T|--upload-file|-X|--request)
+        skip_next=true
+        continue
+        ;;
+      --data=*|--data-ascii=*|--data-binary=*|--data-urlencode=*|--data-raw=*|--form=*|--form-string=*|--upload-file=*|--request=*)
+        continue
+        ;;
+      ## -G/--get has no value but changes data-handling semantics and
+      ## is meaningless without -d; safe to drop for a HEAD probe.
+      -G|--get)
         continue
         ;;
     esac
@@ -489,9 +540,10 @@ main() {
   ## Launching into the background required.
   ## If attempting to refactor this, make sure signal sigterm stops downloads.
   header_download="false" curl_download "$@" &
+  curl_download_pid="$!"
 
   wait_exit_code=0
-  wait "$!" &>/dev/null || { wait_exit_code=$? ; true; };
+  wait "$curl_download_pid" &>/dev/null || { wait_exit_code=$? ; true; };
   true "${BASH_SOURCE[0]} INFO: File download done."
   true "${BASH_SOURCE[0]} INFO: END."
   exit "$wait_exit_code"
