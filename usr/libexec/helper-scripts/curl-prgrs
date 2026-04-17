@@ -184,8 +184,7 @@ shutdown() {
   #stat="$(stcat "$statusfile")"
   #stecho "$stat" >&4
 
-  : "${curl_pid:=""}"
-  if [ -n "$curl_pid" ] && kill -0 -- "$curl_pid" 2>/dev/null ; then
+  if test -n "${curl_pid-}" && kill -0 -- "$curl_pid" 2>/dev/null ; then
     kill -s sigkill -- "$curl_pid" &>/dev/null || true
   fi
 
@@ -286,11 +285,8 @@ curl_exit() {
   if [ "$curl_exit_code" = "0" ]; then
     return 0
   fi
-  : "${curl_pid:=""}"
-  if [ "$curl_pid" != "" ]; then
-    if kill -0 -- "$curl_pid" 2>/dev/null; then
-      kill -s SIGKILL -- "$curl_pid" &>/dev/null || true
-    fi
+  if test -n "${curl_pid-}" && kill -0 -- "$curl_pid" 2>/dev/null ; then
+    kill -s SIGKILL -- "$curl_pid" &>/dev/null || true
   fi
   return "$curl_exit_code"
 }
@@ -438,7 +434,7 @@ scan_curl_arguments() {
 }
 
 main() {
-  local header_file
+  local header_file clen_file
 
   ## {{{ Debugging.
 #   local i arg
@@ -464,41 +460,50 @@ main() {
   ## }}}
 
   header_file="$temporary_directory/header"
+  clen_file="$temporary_directory/content_length"
 
   true "${BASH_SOURCE[0]} INFO: Download header..."
 
-  ## Determine curl_prgrs_content_length.
-  ## While we don't know the expected size of the header,
-  ## curl_prgrs_content_length and
-  ## CURL_PRGRS_MAX_FILE_SIZE_BYTES are set to reasonable values.
+  ## HEAD probe: capture Content-Length into clen_file by redirecting
+  ## curl_download's stdout (which inherits into the backgrounded curl
+  ## so that --write-out lands in the file). No command substitution,
+  ## so curl runs in the parent shell and curl_pid is visible to
+  ## shutdown() directly -- signal handling is uniform with the main
+  ## download path.
   ##
-  ## CURL_PRGRS_EXEC="" to avoid a progress bar for the header download.
-  ## That would confuse yad.
-  ##
-  ## CURL_OUT_FILE and
-  ## --output "$header_file" to avoid overwriting files when using "--continue-at -".
-  ## '--write-out' will echo.
-  ## curl_prgrs_length_known="no" for the HEAD probe: the
-  ## "expected_header_size" sentinel of 8000 is just a placeholder, not
-  ## an actual prediction of header bytes, so the 114/115 size-equality
-  ## checks must not be applied and the progress bar must not be drawn.
-  ## The 81 cap via maximum_http_header_size still enforces an upper
-  ## bound.
-  curl_prgrs_content_length="$(
-    header_download="true" \
-    curl_prgrs_content_length="$expected_header_size" \
-    curl_prgrs_length_known="no" \
-    CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size" \
-    CURL_PRGRS_EXEC="" \
-    CURL_OUT_FILE="$header_file" \
-      curl_download \
-        --head \
-        --write-out '%header{Content-Length}' \
-        "${header_arguments[@]}" \
-        --output "$header_file" \
-    )"
+  ## Per-call overrides (applied as a temporary-assignment prefix):
+  ## - curl_prgrs_content_length="$expected_header_size": a placeholder
+  ##   for the pre-header-parse phase; never used for comparison
+  ##   because curl_prgrs_length_known="no" gates those checks off.
+  ## - curl_prgrs_length_known="no": disables 114/115 and the progress
+  ##   bar for the probe; the expected_header_size sentinel is not an
+  ##   actual prediction of header bytes.
+  ## - CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size": cap
+  ##   (32 KB) on header response size still applies via the 81 check.
+  ## - CURL_PRGRS_EXEC="" so yad (or any external progress updater)
+  ##   does not flash during the probe.
+  ## - CURL_OUT_FILE plus --output "$header_file" send the response
+  ##   headers to header_file so --continue-at behavior on a user's
+  ##   real output file is not disturbed.
+  header_download="true" \
+  curl_prgrs_content_length="$expected_header_size" \
+  curl_prgrs_length_known="no" \
+  CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size" \
+  CURL_PRGRS_EXEC="" \
+  CURL_OUT_FILE="$header_file" \
+    curl_download \
+      --head \
+      --write-out '%header{Content-Length}' \
+      "${header_arguments[@]}" \
+      --output "$header_file" \
+      > "$clen_file"
 
-  ## Reset from previews invocation of curl_download, which calls print_progress.
+  curl_prgrs_content_length=""
+  if test -f "$clen_file"; then
+    IFS= read -r curl_prgrs_content_length < "$clen_file" || true
+  fi
+
+  ## Reset from previous invocation of curl_download, which calls print_progress.
   percent_last=""
 
   true "${BASH_SOURCE[0]} INFO: Header download done."
