@@ -103,12 +103,6 @@ initialize_variables() {
   # exit status of curl from the forked child process back to the parent.
   statusfile="${temporary_directory}/status"
 
-  ## curl's PID is set in the backgrounded curl_download subshell and
-  ## does not propagate back to the parent. The subshell writes it here
-  ## so that the parent's shutdown handler can kill curl directly on
-  ## SIGTERM/SIGINT/SIGHUP rather than orphaning it.
-  curl_pidfile="${temporary_directory}/curl.pid"
-
   expected_header_size=8000
   maximum_http_header_size=32000
 }
@@ -190,38 +184,17 @@ shutdown() {
   #stat="$(stcat "$statusfile")"
   #stecho "$stat" >&4
 
-  ## Recover curl's PID from the shared pidfile: when shutdown runs in
-  ## the parent shell, the local curl_pid is unset (it was assigned
-  ## inside the backgrounded curl_download subshell). Without this,
-  ## SIGTERM to the script would orphan the running curl process.
-  local curl_pid_from_file=""
-  if [ -n "${curl_pidfile-}" ] && [ -f "$curl_pidfile" ]; then
-    curl_pid_from_file="$(stcat "$curl_pidfile")"
-    if ! is_whole_number "$curl_pid_from_file"; then
-      curl_pid_from_file=""
-    fi
+  : "${curl_pid:=""}"
+  if [ -n "$curl_pid" ] && kill -0 -- "$curl_pid" 2>/dev/null ; then
+    kill -s sigkill -- "$curl_pid" &>/dev/null || true
   fi
 
-  : "${curl_pid:=""}"
-  : "${curl_download_pid:=""}"
-
-  processes_list="$curl_pid $curl_pid_from_file $curl_download_pid"
-  for processes_item in $processes_list ; do
-    if kill -0 -- "$processes_item" 2>/dev/null ; then
-      #ps -p "$processes_item" || true
-      kill -s sigkill -- "$processes_item" &>/dev/null || true
-    fi
-  done
-
-  ## Only the original shell should clean up the temp dir. If shutdown
-  ## runs inside a backgrounded subshell (BASHPID != $$), removing the
-  ## statusfile here would leave the parent with no way to recover the
-  ## specific exit code written by curl_exit. Cleanup runs after the
-  ## kill step so we can read curl_pidfile first.
-  if [ "$BASHPID" = "$$" ]; then
-    if [ -n "${temporary_directory-}" ]; then
-      safe-rm -r -f -- "$temporary_directory"
-    fi
+  ## Only the original shell should clean up the temp dir. The HEAD
+  ## probe uses $(...) which is a subshell; if its ERR trap fires and
+  ## runs shutdown in the subshell, removing the temp dir there would
+  ## leave the parent unable to read the statusfile.
+  if [ "$BASHPID" = "$$" ] && [ -n "${temporary_directory-}" ]; then
+    safe-rm -r -f -- "$temporary_directory"
   fi
 
   if [ -n "${error_exit_code-}" ]; then
@@ -344,7 +317,6 @@ curl_download() {
 
   $CURL --no-progress-meter "$@" &
   curl_pid="$!"
-  stecho "$curl_pid" > "$curl_pidfile"
 
   if ! is_whole_number "$curl_prgrs_content_length" ; then
     handle_unknown_content_length
@@ -537,16 +509,17 @@ main() {
 
   true "${BASH_SOURCE[0]} INFO: Download file..."
 
-  ## Launching into the background required.
-  ## If attempting to refactor this, make sure signal sigterm stops downloads.
-  header_download="false" curl_download "$@" &
-  curl_download_pid="$!"
+  ## Foreground execution: curl_download runs in the parent shell, so
+  ## curl_pid is directly accessible to the shutdown handler and no
+  ## subshell bookkeeping is needed. A trapped signal (SIGINT/SIGTERM/
+  ## SIGHUP) fires after the polling loop's current `sleep 1` returns,
+  ## i.e. within ~1 second. A failure inside curl_download propagates
+  ## via set -e / the ERR trap and shutdown reads the specific status
+  ## from the statusfile.
+  header_download="false" curl_download "$@"
 
-  wait_exit_code=0
-  wait "$curl_download_pid" &>/dev/null || { wait_exit_code=$? ; true; };
   true "${BASH_SOURCE[0]} INFO: File download done."
   true "${BASH_SOURCE[0]} INFO: END."
-  exit "$wait_exit_code"
 }
 
 ## FD 4 must be opened before traps are installed: the shutdown handler
