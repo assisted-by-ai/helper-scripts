@@ -92,8 +92,11 @@ initialize_variables() {
   has "$CURL"
   has safe-rm
   has mktemp
+  has stat
+  has sleep
   has stecho
   has stcat
+  has sanitize-string
 
   temporary_directory="$(mktemp --directory)"
 
@@ -127,10 +130,10 @@ check_variables() {
 shutdown() {
   local exit_code="$?"
   local signal="$1"
-  if [ "$signal" = "err" ]; then
+  if [ "$signal" = "ERR" ]; then
     stecho "${BASH_SOURCE[0]} ERROR: Signal $signal received. Exiting." >&4
     stecho "${BASH_SOURCE[0]} ERROR: BASH_COMMAND '$BASH_COMMAND' exit code '$exit_code'." >&4
-  elif [ "$signal" = "exit" ]; then
+  elif [ "$signal" = "EXIT" ]; then
     true "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting."
   else
     stecho "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting." >&4
@@ -166,10 +169,10 @@ shutdown() {
   ## 0 written by the preceding HEAD probe.
   if [ -z "${error_exit_code-}" ] && [ "$status" = "0" ]; then
     case "$signal" in
-      err)     error_exit_code=110 ;;
-      sigint)  error_exit_code=130 ;;
-      sigterm) error_exit_code=143 ;;
-      sighup)  error_exit_code=129 ;;
+      ERR)     error_exit_code=110 ;;
+      SIGINT)  error_exit_code=130 ;;
+      SIGTERM) error_exit_code=143 ;;
+      SIGHUP)  error_exit_code=129 ;;
     esac
   fi
 
@@ -207,11 +210,11 @@ shutdown() {
 
 traps_enable() {
   # Register our `shutdown` function to be invoked when the process dies.
-  trap "shutdown sigint" SIGINT
-  trap "shutdown sigterm" SIGTERM
-  trap "shutdown err" ERR
-  trap "shutdown exit" EXIT
-  trap "shutdown sighup" SIGHUP
+  trap "shutdown SIGINT" SIGINT
+  trap "shutdown SIGTERM" SIGTERM
+  trap "shutdown ERR" ERR
+  trap "shutdown EXIT" EXIT
+  trap "shutdown SIGHUP" SIGHUP
 }
 
 # The `print_progress` function draws our progress bar to the screen. It
@@ -299,7 +302,7 @@ enforce_max_filesize() {
   if [ ! -f "$CURL_OUT_FILE" ]; then
     return 0
   fi
-  size_file_downloaded_bytes="$(stat -c "%s" "$CURL_OUT_FILE")"
+  size_file_downloaded_bytes="$(stat -c "%s" -- "$CURL_OUT_FILE")"
   if ! is_whole_number "$size_file_downloaded_bytes" ; then
     curl_exit 113
   fi
@@ -366,18 +369,32 @@ curl_download() {
   curl_exit "$curl_exit_code"
 }
 
-## Single pass over the user-supplied curl args:
-## - builds header_arguments: a copy with body-writing and resume-related
-##   flags stripped, safe to pass to a HEAD probe.
-## - sets curl_prgrs_length_known="no" if the user requested transparent
-##   decompression, since the on-disk size will then legitimately differ
-##   from the server-reported Content-Length and would otherwise produce
-##   spurious 114/115 mismatches and a misleading progress bar.
+## Single pass over the user-supplied curl args. Populates two arrays:
+##
+## - header_arguments: args safe to pass to the HEAD probe. Resume,
+##   body-writing, method-changing, and output-writing flags are all
+##   stripped, as are --write-out (so the probe's own --write-out is
+##   the only one curl sees).
+##
+## - download_arguments: args for the main download. Only the
+##   output-writing flags (-o, --output, -O/--remote-name, -J/
+##   --remote-header-name, --remote-name-all) are stripped, because
+##   curl-prgrs pins curl's output to CURL_OUT_FILE. Without this, a
+##   caller could pass -O and curl would write the body to a
+##   URL-derived filename that our stat-based 81 max-filesize check
+##   never sees, bypassing the TUF endless-data mitigation.
+##
+## Also sets curl_prgrs_length_known="no" when transparent decompression
+## is requested (--compressed etc.), since the on-disk size will then
+## legitimately differ from Content-Length.
 scan_curl_arguments() {
   local arg_item
-  local arg_list=()
-  local skip_next=false
+  local head_skip=false
+  local main_skip=false
+  local keep_head keep_main
+
   header_arguments=()
+  download_arguments=()
 
   for arg_item in "$@"; do
     case "$arg_item" in
@@ -386,51 +403,76 @@ scan_curl_arguments() {
         ;;
     esac
 
-    if [ "$skip_next" = true ]; then
-      skip_next=false
-      continue
+    keep_head=true
+    keep_main=true
+
+    if [ "$head_skip" = true ]; then
+      head_skip=false
+      keep_head=false
+    fi
+    if [ "$main_skip" = true ]; then
+      main_skip=false
+      keep_main=false
     fi
 
     case "$arg_item" in
-      ## Options that take a value as the next argument.
-      --continue-at|-C|--output|-o)
-        skip_next=true
-        continue
+      ## Output-writing flags: strip from BOTH. curl-prgrs injects its
+      ## own --output "$CURL_OUT_FILE" so that the file our polling
+      ## loop stats is always the file curl is writing to.
+      -o|--output)
+        head_skip=true
+        main_skip=true
+        keep_head=false
+        keep_main=false
         ;;
-      --continue-at=*|--output=*)
-        continue
+      --output=*)
+        keep_head=false
+        keep_main=false
         ;;
-      ## -O/--remote-name and -J/--remote-header-name would otherwise
-      ## cause curl to write the response body to a filename derived
-      ## from the URL or Content-Disposition header during the HEAD
-      ## probe.
       -O|--remote-name|-J|--remote-header-name|--remote-name-all)
-        continue
+        keep_head=false
+        keep_main=false
         ;;
-      ## Body-writing / method-changing flags. A HEAD probe must not
-      ## send a request body, and -X/--request would override the
-      ## --head we add. Strip the flag and its value.
+      ## HEAD-only strips: resume. The probe must not try to resume an
+      ## existing file.
+      --continue-at|-C)
+        head_skip=true
+        keep_head=false
+        ;;
+      --continue-at=*)
+        keep_head=false
+        ;;
+      ## HEAD-only strips: body and method flags. A HEAD probe must
+      ## not send a request body, and -X/--request would override the
+      ## --head we inject.
       -d|--data|--data-ascii|--data-binary|--data-urlencode|--data-raw|-F|--form|--form-string|-T|--upload-file|-X|--request)
-        skip_next=true
-        continue
+        head_skip=true
+        keep_head=false
         ;;
       --data=*|--data-ascii=*|--data-binary=*|--data-urlencode=*|--data-raw=*|--form=*|--form-string=*|--upload-file=*|--request=*)
-        continue
+        keep_head=false
         ;;
-      ## -G/--get has no value but changes data-handling semantics and
-      ## is meaningless without -d; safe to drop for a HEAD probe.
       -G|--get)
-        continue
+        keep_head=false
+        ;;
+      ## HEAD-only strip: --write-out. The probe's own --write-out
+      ## '%header{Content-Length}' must be the last one curl sees.
+      --write-out|-w)
+        head_skip=true
+        keep_head=false
+        ;;
+      --write-out=*)
+        keep_head=false
         ;;
     esac
 
-    arg_list+=("$arg_item")
+    if [ "$keep_head" = true ]; then
+      header_arguments+=("$arg_item")
+    fi
+    if [ "$keep_main" = true ]; then
+      download_arguments+=("$arg_item")
+    fi
   done
-
-  header_arguments=("${arg_list[@]}")
-
-  ## Cannot use. Collapses newlines.
-  #stecho "${args[@]}"
 }
 
 main() {
@@ -446,7 +488,7 @@ main() {
 #   done
   ## }}}
 
-  ## sets: header_arguments, curl_prgrs_length_known
+  ## sets: header_arguments, download_arguments, curl_prgrs_length_known
   scan_curl_arguments "$@"
 
   ## {{{ Debugging.
@@ -498,9 +540,16 @@ main() {
       --output "$header_file" \
       > "$clen_file"
 
+  ## Sanitize and bound the server-supplied Content-Length before
+  ## using it in arithmetic. sanitize-string strips control characters
+  ## and caps the length; 18 digits is ~1 EB, safely within bash's
+  ## signed 64-bit integer range (max 9.22 * 10^18). Without this, a
+  ## server could send an absurdly long Content-Length string and
+  ## cause bash's `[ X -gt Y ]` to error on overflow, DoSing the
+  ## script via the ERR trap.
   curl_prgrs_content_length=""
   if test -f "$clen_file"; then
-    IFS= read -r curl_prgrs_content_length < "$clen_file" || true
+    curl_prgrs_content_length="$(sanitize-string -- 18 < "$clen_file" 2>/dev/null || true)"
   fi
 
   ## Reset from previous invocation of curl_download, which calls print_progress.
@@ -521,7 +570,17 @@ main() {
   ## i.e. within ~1 second. A failure inside curl_download propagates
   ## via set -e / the ERR trap and shutdown reads the specific status
   ## from the statusfile.
-  header_download="false" curl_download "$@"
+  ##
+  ## --output "$CURL_OUT_FILE" is pinned here, before the user's args,
+  ## so that curl always writes to the file the 81 max-filesize
+  ## watchdog stats. scan_curl_arguments already stripped any user
+  ## -o/--output/-O/--remote-name/-J/--remote-header-name from
+  ## download_arguments so they cannot redirect curl elsewhere.
+  ## Placing --output first (and not after any potential user `--`)
+  ## guarantees curl parses it as an option rather than a URL.
+  header_download="false" curl_download \
+    --output "$CURL_OUT_FILE" \
+    "${download_arguments[@]}"
 
   true "${BASH_SOURCE[0]} INFO: File download done."
   true "${BASH_SOURCE[0]} INFO: END."
