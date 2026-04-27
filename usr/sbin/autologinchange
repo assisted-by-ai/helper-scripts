@@ -451,7 +451,8 @@ cli_disable_autologin() {
       printf '%s\n' "INFO: Autologin already disabled for account 'sysmaint', exiting." >&2
       return 0
     fi
-    if ! block_on_unusable_password 'sysmaint' 'cli'; then
+    if ! warn_on_unusable_password 'sysmaint'; then
+      printf '%s\n' "Please set a password first using: sudo pwchange" >&2
       return 1
     fi
     disable_sysmaint_autologin
@@ -464,105 +465,27 @@ cli_disable_autologin() {
     return 0
   fi
 
-  if ! block_on_unusable_password "${user}" 'cli'; then
+  if ! warn_on_unusable_password "${user}"; then
+    printf '%s\n' "Please set a password first using: sudo pwchange" >&2
     return 1
   fi
   disable_autologin "${user}"
 }
 
-## Returns 0 if password is usable, 1 if locked/disabled, 2 if empty.
-check_password_usability() {
+warn_on_unusable_password() {
   local user
   user="$1"
   if is_pass_locked "${user}" || is_pass_disabled "${user}"; then
-    return 1
-  elif [ -z "$(get_clean_pass "${user}")" ]; then
-    return 2
-  fi
-  return 0
-}
-
-## Block disabling autologin if the account password is locked or disabled.
-## In CLI (non-interactive) mode, refuse and return 1.
-## In interactive mode, launch an inline password-change prompt and only
-## proceed once a valid password is confirmed.
-## Empty (but not locked) passwords produce a non-blocking warning.
-## Usage: block_on_unusable_password USER MODE
-##   MODE: 'cli' or 'interactive'
-block_on_unusable_password() {
-  local user mode pass_status
-  user="$1"
-  mode="${2:-cli}"
-
-  pass_status=0
-  check_password_usability "${user}" || pass_status="$?"
-
-  if [ "${pass_status}" = '1' ]; then
     printf '%s\n' "${red}ERROR:${nocolor} Account '${user}' has a locked or disabled password." >&2
     printf '%s\n' "Disabling autologin would make this account impossible to log into." >&2
-    if [ "${mode}" = 'cli' ]; then
-      printf '%s\n' "Please set a password first using: sudo pwchange" >&2
-      printf '%s\n' "See https://www.kicksecure.com/wiki/User#Locking_a_Password for more information." >&2
-      return 1
-    fi
-    printf '%s\n' "You must set a password before disabling autologin." >&2
     printf '%s\n' "See https://www.kicksecure.com/wiki/User#Locking_a_Password for more information." >&2
-    printf '%s\n' "" >&2
-    printf '%s\n' "Launching password setup for account '${user}'..." >&2
-    if ! pwchange_for_user "${user}"; then
-      printf '%s\n' "${red}ERROR:${nocolor} Password was not set. Autologin will NOT be disabled." >&2
-      return 1
-    fi
-    if check_password_usability "${user}"; then
-      printf '%s\n' "Password set successfully. Proceeding to disable autologin." >&2
-    else
-      printf '%s\n' "${red}ERROR:${nocolor} Password is still not usable. Autologin will NOT be disabled." >&2
-      return 1
-    fi
-  elif [ "${pass_status}" = '2' ]; then
+    return 1
+  elif [ -z "$(get_clean_pass "${user}")" ]; then
     printf '%s\n' "${yellow}WARNING:${nocolor} Account '${user}' has no password set." >&2
     printf '%s\n' "Anyone can log into this account knowing only the username." >&2
     printf '%s\n' "You can use the 'pwchange' utility to set a password." >&2
     printf '%s\n' "See https://www.kicksecure.com/wiki/Login for more information." >&2
   fi
-  return 0
-}
-
-pwchange_for_user() {
-  local user first_input second_input
-  user="$1"
-
-  # shellcheck source=../libexec/helper-scripts/get_password.sh
-  source /usr/libexec/helper-scripts/get_password.sh
-
-  printf '%s\n' "Enter the new password for account '${user}':" >&2
-  get_password
-  first_input="${password}"
-  echo >&2
-
-  printf '%s\n' "Re-enter the new password to confirm:" >&2
-  get_password
-  second_input="${password}"
-  echo >&2
-
-  if [ "${first_input}" != "${second_input}" ]; then
-    printf '%s\n' "ERROR: Passwords do not match. Password has not been changed." >&2
-    return 1
-  fi
-
-  if [ -z "${first_input}" ]; then
-    printf '%s\n' "ERROR: Empty password not allowed when disabling autologin." >&2
-    return 1
-  fi
-
-  chpasswd <<< "${user}:${first_input}"
-
-  unset first_input
-  unset second_input
-  unset password
-
-  printf '%s\n' "SUCCESS: Password for account '${user}' has been updated." >&2
-  return 0
 }
 
 autologinchange() {
@@ -587,8 +510,8 @@ autologinchange() {
     read -r -p "Would you like to disable autologin? [Y/N] " -- disable_yn
 
     if [ "${disable_yn,,}" = 'y' ]; then
-      if ! block_on_unusable_password "${user}" 'interactive'; then
-        printf '%s\n' "CANCELLED disabling autologin for account '$user'." >&2
+      if ! warn_on_unusable_password "${user}"; then
+        printf '%s\n' "Please set a password first using: sudo pwchange" >&2
         return 1
       fi
       disable_autologin "${user}"
@@ -603,8 +526,8 @@ autologinchange() {
       read -r -p "Would you like to disable autologin for sysmaint session? [Y/N] " -- disable_yn
 
       if [ "${disable_yn,,}" = 'y' ]; then
-        if ! block_on_unusable_password 'sysmaint' 'interactive'; then
-          printf '%s\n' "CANCELLED disabling autologin for account 'sysmaint'." >&2
+        if ! warn_on_unusable_password 'sysmaint'; then
+          printf '%s\n' "Please set a password first using: sudo pwchange" >&2
           return 1
         fi
         disable_sysmaint_autologin
