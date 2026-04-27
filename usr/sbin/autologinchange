@@ -494,8 +494,8 @@ block_on_unusable_password() {
   user="$1"
   mode="${2:-cli}"
 
-  check_password_usability "${user}" || true
-  pass_status="$?"
+  pass_status=0
+  check_password_usability "${user}" || pass_status="$?"
 
   if [ "${pass_status}" = '1' ]; then
     printf '%s\n' "${red}ERROR:${nocolor} Account '${user}' has a locked or disabled password." >&2
