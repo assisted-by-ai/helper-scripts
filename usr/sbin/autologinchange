@@ -451,8 +451,10 @@ cli_disable_autologin() {
       printf '%s\n' "INFO: Autologin already disabled for account 'sysmaint', exiting." >&2
       return 0
     fi
+    if ! block_on_unusable_password 'sysmaint'; then
+      return 1
+    fi
     disable_sysmaint_autologin
-    warn_on_unusable_password 'sysmaint'
     return 0
   fi
 
@@ -462,20 +464,23 @@ cli_disable_autologin() {
     return 0
   fi
 
+  if ! block_on_unusable_password "${user}"; then
+    return 1
+  fi
   disable_autologin "${user}"
-  warn_on_unusable_password "${user}"
 }
 
-warn_on_unusable_password() {
+block_on_unusable_password() {
   local user
   user="$1"
   if is_pass_locked "${user}" || is_pass_disabled "${user}"; then
-    printf '%s\n' "${red}WARNING:${nocolor} Account '${user}' has a locked or disabled password." >&2
-    printf '%s\n' "You will NOT be able to log in manually to this account." >&2
-    printf '%s\n' "You can use the 'pwchange' utility to set a password." >&2
+    printf '%s\n' "${red}ERROR:${nocolor} Account '${user}' has a locked or disabled password." >&2
+    printf '%s\n' "Disabling autologin would make this account impossible to log into." >&2
+    printf '%s\n' "Please set a password first using: sudo pwchange" >&2
     printf '%s\n' "See https://www.kicksecure.com/wiki/User#Locking_a_Password for more information." >&2
+    return 1
   elif [ -z "$(get_clean_pass "${user}")" ]; then
-    printf '%s\n' "${red}WARNING:${nocolor} Account '${user}' has no password set." >&2
+    printf '%s\n' "${yellow}WARNING:${nocolor} Account '${user}' has no password set." >&2
     printf '%s\n' "Anyone can log into this account knowing only the username." >&2
     printf '%s\n' "You can use the 'pwchange' utility to set a password." >&2
     printf '%s\n' "See https://www.kicksecure.com/wiki/Login for more information." >&2
@@ -504,9 +509,11 @@ autologinchange() {
     read -r -p "Would you like to disable autologin? [Y/N] " -- disable_yn
 
     if [ "${disable_yn,,}" = 'y' ]; then
+      if ! block_on_unusable_password "${user}"; then
+        return 1
+      fi
       disable_autologin "${user}"
       printf '%s\n' "SUCCESS: Autologin for account '$user' disabled." >&2
-      warn_on_unusable_password "${user}"
     else
       printf '%s\n' "CANCELLED disabling autologin for account '$user'." >&2
     fi
@@ -517,9 +524,11 @@ autologinchange() {
       read -r -p "Would you like to disable autologin for sysmaint session? [Y/N] " -- disable_yn
 
       if [ "${disable_yn,,}" = 'y' ]; then
+        if ! block_on_unusable_password 'sysmaint'; then
+          return 1
+        fi
         disable_sysmaint_autologin
         printf '%s\n' "SUCCESS: Autologin for account 'sysmaint' disabled." >&2
-        warn_on_unusable_password 'sysmaint'
       else
         printf '%s\n' "CANCELLED disabling autologin for account 'sysmaint'." >&2
       fi
