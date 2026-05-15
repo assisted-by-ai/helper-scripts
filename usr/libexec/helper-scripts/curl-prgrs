@@ -58,6 +58,9 @@ source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/progress-bar
 ## provides: is_whole_number
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/strings.bsh
 
+## provides: has
+source /usr/libexec/helper-scripts/has.sh
+
 initialize_terminal() {
   # We want to print the progress bar to stderr, but only if stderr is a
   # terminal. To avoid a conditional every time we print something, we can
@@ -72,19 +75,29 @@ initialize_terminal() {
 }
 
 initialize_variables() {
-  command -v tput >/dev/null
-  command -v curl >/dev/null
-  command -v safe-rm >/dev/null
-  command -v mktemp >/dev/null
-
   : "${CURL:="curl"}"
   : "${CURL_PRGRS_MAX_FILE_SIZE_BYTES:=""}"
   : "${CURL_OUT_FILE:=""}"
   : "${CURL_PRGRS_EXEC:=""}"
   : "${curl_prgrs_print_progress:="yes"}"
   percent_last=""
+  ## "yes" means the server-reported Content-Length is known and matches
+  ## what will be written to disk. Set to "no" when Content-Length is
+  ## missing or when transparent decompression makes the on-disk size
+  ## differ from the reported value. When "no", the progress bar and
+  ## the 114/115 size-equality checks are both skipped; the 81
+  ## max-filesize cap still applies.
+  curl_prgrs_length_known="yes"
 
-  temp_dir_auto_generated=true
+  has "$CURL"
+  has safe-rm
+  has mktemp
+  has stat
+  has sleep
+  has stecho
+  has stcat
+  has sanitize-string
+
   temporary_directory="$(mktemp --directory)"
 
   # Compute names for our temporary files by joining the current date and
@@ -117,13 +130,11 @@ check_variables() {
 shutdown() {
   local exit_code="$?"
   local signal="$1"
-  local last_err="$BASH_COMMAND"
-  if [ "$signal" = "err" ]; then
+  if [ "$signal" = "ERR" ]; then
     stecho "${BASH_SOURCE[0]} ERROR: Signal $signal received. Exiting." >&4
     stecho "${BASH_SOURCE[0]} ERROR: BASH_COMMAND '$BASH_COMMAND' exit code '$exit_code'." >&4
-    error_exit_code=110
-  elif [ "$signal" = "exit" ]; then
-    true "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting." >&4
+  elif [ "$signal" = "EXIT" ]; then
+    true "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting."
   else
     stecho "${BASH_SOURCE[0]} INFO: Signal $signal received. Exiting." >&4
   fi
@@ -137,7 +148,7 @@ shutdown() {
 
   local status
 
-  if [ -f "$statusfile" ]; then
+  if [ -n "${statusfile-}" ] && [ -f "$statusfile" ]; then
     true "${BASH_SOURCE[0]} INFO: got status file"
     status="$(stcat "$statusfile")"
     if ! is_whole_number "$status"; then
@@ -151,6 +162,20 @@ shutdown() {
     error_exit_code="112"
   fi
 
+  ## Prefer the specific status that curl_exit wrote to the statusfile
+  ## (e.g. 81, 114, 115, any genuine curl code). Only derive an exit
+  ## code from the signal itself when nothing specific was recorded —
+  ## otherwise a SIGTERM arriving mid-download would inherit the stale
+  ## 0 written by the preceding HEAD probe.
+  if [ -z "${error_exit_code-}" ] && [ "$status" = "0" ]; then
+    case "$signal" in
+      ERR)     error_exit_code=110 ;;
+      SIGINT)  error_exit_code=130 ;;
+      SIGTERM) error_exit_code=143 ;;
+      SIGHUP)  error_exit_code=129 ;;
+    esac
+  fi
+
   # If we are exiting normally, jump back to the beginning of the line
   # and clear it. Otherwise, print a newline.
   if [ "$status" -eq 0 ]; then
@@ -162,20 +187,17 @@ shutdown() {
   #stat="$(stcat "$statusfile")"
   #stecho "$stat" >&4
 
-  if [ "$temp_dir_auto_generated" = "true" ]; then
-    safe-rm -r -f -- "$temporary_directory"
+  if test -n "${curl_pid-}" && kill -0 -- "$curl_pid" 2>/dev/null ; then
+    kill -s sigkill -- "$curl_pid" &>/dev/null || true
   fi
 
-  true curl_pid
-  : "${curl_pid:=""}"
-
-  processes_list="$curl_pid"
-  for processes_item in $processes_list ; do
-    if kill -0 -- "$processes_item" 2>/dev/null ; then
-      #ps -p "$processes_item" || true
-      kill -s sigkill -- "$processes_item" &>/dev/null || true
-    fi
-  done
+  ## Only the original shell should clean up the temp dir. The HEAD
+  ## probe uses $(...) which is a subshell; if its ERR trap fires and
+  ## runs shutdown in the subshell, removing the temp dir there would
+  ## leave the parent unable to read the statusfile.
+  if [ "$BASHPID" = "$$" ] && [ -n "${temporary_directory-}" ]; then
+    safe-rm -r -f -- "$temporary_directory"
+  fi
 
   if [ -n "${error_exit_code-}" ]; then
      true "${BASH_SOURCE[0]} INFO: exit with error_exit_code $error_exit_code"
@@ -188,11 +210,11 @@ shutdown() {
 
 traps_enable() {
   # Register our `shutdown` function to be invoked when the process dies.
-  trap "shutdown sigint" SIGINT
-  trap "shutdown sigterm" SIGTERM
-  trap "shutdown err" ERR
-  trap "shutdown exit" EXIT
-  trap "shutdown sighup" SIGHUP
+  trap "shutdown SIGINT" SIGINT
+  trap "shutdown SIGTERM" SIGTERM
+  trap "shutdown ERR" ERR
+  trap "shutdown EXIT" EXIT
+  trap "shutdown SIGHUP" SIGHUP
 }
 
 # The `print_progress` function draws our progress bar to the screen. It
@@ -213,12 +235,17 @@ print_progress() {
   # progress bar. (This helps avoid a flicker when following redirects.)
   #[ "$length" -gt 8192 ] || return 0
 
+  # Avoid division by zero when the server reports Content-Length: 0.
+  if [ "$length" -le 0 ]; then
+    return 0
+  fi
+
   # Calculate the progress percentage and the size of the filled and
   # unfilled portions of the progress bar.
   local percent
   true "${BASH_SOURCE[0]} INFO: bytes: '$bytes'"
   true "${BASH_SOURCE[0]} INFO: length: '$length'"
-  percent=$(( $bytes * 100 / $length ))
+  percent=$(( bytes * 100 / length ))
 
   if ! is_whole_number "$percent" ; then
     curl_exit 113
@@ -245,6 +272,15 @@ print_progress() {
   percent_last="$percent"
 }
 
+## Tolerate a missing or non-numeric Content-Length (chunked transfer,
+## dynamic responses, some CDNs). Disables the progress bar and the
+## strict 114/115 size-equality checks since there is nothing to
+## compare against; the 81 max-filesize cap from
+## CURL_PRGRS_MAX_FILE_SIZE_BYTES still bounds the download.
+handle_unknown_content_length() {
+  curl_prgrs_length_known="no"
+}
+
 curl_exit() {
   curl_exit_code="$1"
   true "${BASH_SOURCE[0]} INFO: write $curl_exit_code to $statusfile"
@@ -252,13 +288,27 @@ curl_exit() {
   if [ "$curl_exit_code" = "0" ]; then
     return 0
   fi
-  : "${curl_pid:=""}"
-  if [ "$curl_pid" != "" ]; then
-    if kill -0 -- "$curl_pid" 2>/dev/null; then
-      kill -s SIGKILL -- "$curl_pid" &>/dev/null || true
-    fi
+  if test -n "${curl_pid-}" && kill -0 -- "$curl_pid" 2>/dev/null ; then
+    kill -s SIGKILL -- "$curl_pid" &>/dev/null || true
   fi
   return "$curl_exit_code"
+}
+
+## Stat the output file and enforce the max-filesize cap. Used both
+## inside the polling loop and once more after curl exits, so a fast
+## completion that slips between poll iterations cannot evade the TUF
+## endless-data mitigation.
+enforce_max_filesize() {
+  if [ ! -f "$CURL_OUT_FILE" ]; then
+    return 0
+  fi
+  size_file_downloaded_bytes="$(stat -c "%s" -- "$CURL_OUT_FILE")"
+  if ! is_whole_number "$size_file_downloaded_bytes" ; then
+    curl_exit 113
+  fi
+  if [ "$size_file_downloaded_bytes" -gt "$CURL_PRGRS_MAX_FILE_SIZE_BYTES" ]; then
+    curl_exit 81
+  fi
 }
 
 curl_download() {
@@ -267,37 +317,26 @@ curl_download() {
   $CURL --no-progress-meter "$@" &
   curl_pid="$!"
 
-  ## Additional validation.
-  ## Already validated earlier, but:
-  ## /usr/libexec/helper-scripts/curl-prgrs: line 266: [: : integer expression expected
   if ! is_whole_number "$curl_prgrs_content_length" ; then
-    curl_exit 116
+    handle_unknown_content_length
   fi
 
   while true ; do
     if [ -f "$CURL_OUT_FILE" ]; then
-      size_file_downloaded_bytes="$(stat -c "%s" "$CURL_OUT_FILE")"
+      enforce_max_filesize
 
-      if ! is_whole_number "$size_file_downloaded_bytes" ; then
-        curl_exit 113
-      fi
+      if [ "$curl_prgrs_length_known" = "yes" ]; then
+        true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
+        true "curl_prgrs_content_length: $curl_prgrs_content_length"
+        if [ "$size_file_downloaded_bytes" -gt "$curl_prgrs_content_length" ]; then
+          curl_exit 114
+        fi
 
-      true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
-      true "CURL_PRGRS_MAX_FILE_SIZE_BYTES: $CURL_PRGRS_MAX_FILE_SIZE_BYTES"
-      if [ "$size_file_downloaded_bytes" -gt "$CURL_PRGRS_MAX_FILE_SIZE_BYTES" ]; then
-        curl_exit 81
-      fi
-
-      true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
-      true "curl_prgrs_content_length: $curl_prgrs_content_length"
-      if [ "$size_file_downloaded_bytes" -gt "$curl_prgrs_content_length" ]; then
-        curl_exit 114
-      fi
-
-      if [ "$curl_prgrs_print_progress" = "yes" ]; then
-        ## Need to print to stderr to avoid confusing the stdout output of this command.
-        #stecho "${BASH_SOURCE[0]} INFO: print_progress '$size_file_downloaded_bytes' '$curl_prgrs_content_length'" >&2
-        print_progress "$size_file_downloaded_bytes" "$curl_prgrs_content_length"
+        if [ "$curl_prgrs_print_progress" = "yes" ]; then
+          ## Need to print to stderr to avoid confusing the stdout output of this command.
+          #stecho "${BASH_SOURCE[0]} INFO: print_progress '$size_file_downloaded_bytes' '$curl_prgrs_content_length'" >&2
+          print_progress "$size_file_downloaded_bytes" "$curl_prgrs_content_length"
+        fi
       fi
     fi
 
@@ -308,10 +347,14 @@ curl_download() {
     sleep 1
   done
 
-  ## curl already terminated.
+  ## curl already terminated. Recheck the max-filesize cap on the final
+  ## file: the loop body may have run zero times or may have missed
+  ## bytes written in the final burst before curl exited.
+  enforce_max_filesize
 
   : "${size_file_downloaded_bytes:=""}"
-  if is_whole_number "$size_file_downloaded_bytes" ; then
+  if [ "$curl_prgrs_length_known" = "yes" ] \
+     && is_whole_number "$size_file_downloaded_bytes" ; then
     true "size_file_downloaded_bytes: $size_file_downloaded_bytes"
     true "curl_prgrs_content_length: $curl_prgrs_content_length"
     if [ "$header_download" = "false" ]; then
@@ -326,47 +369,114 @@ curl_download() {
   curl_exit "$curl_exit_code"
 }
 
-remove_argument_for_header_request() {
+## Single pass over the user-supplied curl args. Populates two arrays:
+##
+## - header_arguments: args safe to pass to the HEAD probe. Resume,
+##   body-writing, method-changing, and output-writing flags are all
+##   stripped, as are --write-out (so the probe's own --write-out is
+##   the only one curl sees).
+##
+## - download_arguments: args for the main download. Only the
+##   output-writing flags (-o, --output, -O/--remote-name, -J/
+##   --remote-header-name, --remote-name-all) are stripped, because
+##   curl-prgrs pins curl's output to CURL_OUT_FILE. Without this, a
+##   caller could pass -O and curl would write the body to a
+##   URL-derived filename that our stat-based 81 max-filesize check
+##   never sees, bypassing the TUF endless-data mitigation.
+##
+## Also sets curl_prgrs_length_known="no" when transparent decompression
+## is requested (--compressed etc.), since the on-disk size will then
+## legitimately differ from Content-Length.
+scan_curl_arguments() {
   local arg_item
-  local arg_list=()
-  local skip_next=false
+  local head_skip=false
+  local main_skip=false
+  local keep_head keep_main
+
   header_arguments=()
+  download_arguments=()
 
   for arg_item in "$@"; do
-    if [ "$skip_next" = true ]; then
-      skip_next=false
-      continue
+    case "$arg_item" in
+      --compressed|--tr-encoding|--compressed-ssh)
+        curl_prgrs_length_known="no"
+        ;;
+    esac
+
+    keep_head=true
+    keep_main=true
+
+    if [ "$head_skip" = true ]; then
+      head_skip=false
+      keep_head=false
+    fi
+    if [ "$main_skip" = true ]; then
+      main_skip=false
+      keep_main=false
     fi
 
-    if [ "$arg_item" = "--continue-at" ]; then
-      skip_next=true
-      continue
-    fi
-    if [ "$arg_item" = "-C" ]; then
-      skip_next=true
-      continue
-    fi
+    case "$arg_item" in
+      ## Output-writing flags: strip from BOTH. curl-prgrs injects its
+      ## own --output "$CURL_OUT_FILE" so that the file our polling
+      ## loop stats is always the file curl is writing to.
+      -o|--output)
+        head_skip=true
+        main_skip=true
+        keep_head=false
+        keep_main=false
+        ;;
+      --output=*)
+        keep_head=false
+        keep_main=false
+        ;;
+      -O|--remote-name|-J|--remote-header-name|--remote-name-all)
+        keep_head=false
+        keep_main=false
+        ;;
+      ## HEAD-only strips: resume. The probe must not try to resume an
+      ## existing file.
+      --continue-at|-C)
+        head_skip=true
+        keep_head=false
+        ;;
+      --continue-at=*)
+        keep_head=false
+        ;;
+      ## HEAD-only strips: body and method flags. A HEAD probe must
+      ## not send a request body, and -X/--request would override the
+      ## --head we inject.
+      -d|--data|--data-ascii|--data-binary|--data-urlencode|--data-raw|-F|--form|--form-string|-T|--upload-file|-X|--request)
+        head_skip=true
+        keep_head=false
+        ;;
+      --data=*|--data-ascii=*|--data-binary=*|--data-urlencode=*|--data-raw=*|--form=*|--form-string=*|--upload-file=*|--request=*)
+        keep_head=false
+        ;;
+      -G|--get)
+        keep_head=false
+        ;;
+      ## HEAD-only strip: --write-out. The probe's own --write-out
+      ## '%header{Content-Length}' must be the last one curl sees.
+      --write-out|-w)
+        head_skip=true
+        keep_head=false
+        ;;
+      --write-out=*)
+        keep_head=false
+        ;;
+    esac
 
-    if [ "$arg_item" = "--output" ]; then
-      skip_next=true
-      continue
+    if [ "$keep_head" = true ]; then
+      header_arguments+=("$arg_item")
     fi
-    if [ "$arg_item" = "-o" ]; then
-      skip_next=true
-      continue
+    if [ "$keep_main" = true ]; then
+      download_arguments+=("$arg_item")
     fi
-
-    arg_list+=("$arg_item")
   done
-
-  header_arguments=("${arg_list[@]}")
-
-  ## Cannot use. Collapses newlines.
-  #stecho "${args[@]}"
 }
 
 main() {
-  local header_file
+  local header_file clen_file
 
   ## {{{ Debugging.
 #   local i arg
@@ -378,8 +488,8 @@ main() {
 #   done
   ## }}}
 
-  ## sets: header_arguments
-  remove_argument_for_header_request "${@}"
+  ## sets: header_arguments, download_arguments, curl_prgrs_length_known
+  scan_curl_arguments "$@"
 
   ## {{{ Debugging.
 #   printf '%s\n' ""
@@ -392,57 +502,95 @@ main() {
   ## }}}
 
   header_file="$temporary_directory/header"
+  clen_file="$temporary_directory/content_length"
 
   true "${BASH_SOURCE[0]} INFO: Download header..."
 
-  ## Determine curl_prgrs_content_length.
-  ## While we don't know the expected size of the header,
-  ## curl_prgrs_content_length and
-  ## CURL_PRGRS_MAX_FILE_SIZE_BYTES are set to reasonable values.
+  ## HEAD probe: capture Content-Length into clen_file by redirecting
+  ## curl_download's stdout (which inherits into the backgrounded curl
+  ## so that --write-out lands in the file). No command substitution,
+  ## so curl runs in the parent shell and curl_pid is visible to
+  ## shutdown() directly -- signal handling is uniform with the main
+  ## download path.
   ##
-  ## CURL_PRGRS_EXEC="" to avoid a progress bar for the header download.
-  ## That would confuse yad.
-  ##
-  ## CURL_OUT_FILE and
-  ## --output "$header_file" to avoid overwriting files when using "--continue-at -".
-  ## '--write-out' will echo.
-  curl_prgrs_content_length="$(
-    header_download="true" \
-    curl_prgrs_content_length="$expected_header_size" \
-    CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size" \
-    CURL_PRGRS_EXEC="" \
-    CURL_OUT_FILE="$header_file" \
-      curl_download \
-        --head \
-        --write-out '%header{Content-Length}' \
-        "${header_arguments[@]}" \
-        --output "$header_file" \
-    )"
+  ## Per-call overrides (applied as a temporary-assignment prefix):
+  ## - curl_prgrs_content_length="$expected_header_size": a placeholder
+  ##   for the pre-header-parse phase; never used for comparison
+  ##   because curl_prgrs_length_known="no" gates those checks off.
+  ## - curl_prgrs_length_known="no": disables 114/115 and the progress
+  ##   bar for the probe; the expected_header_size sentinel is not an
+  ##   actual prediction of header bytes.
+  ## - CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size": cap
+  ##   (32 KB) on header response size still applies via the 81 check.
+  ## - CURL_PRGRS_EXEC="" so yad (or any external progress updater)
+  ##   does not flash during the probe.
+  ## - CURL_OUT_FILE plus --output "$header_file" send the response
+  ##   headers to header_file so --continue-at behavior on a user's
+  ##   real output file is not disturbed.
+  header_download="true" \
+  curl_prgrs_content_length="$expected_header_size" \
+  curl_prgrs_length_known="no" \
+  CURL_PRGRS_MAX_FILE_SIZE_BYTES="$maximum_http_header_size" \
+  CURL_PRGRS_EXEC="" \
+  CURL_OUT_FILE="$header_file" \
+    curl_download \
+      --head \
+      --write-out '%header{Content-Length}' \
+      "${header_arguments[@]}" \
+      --output "$header_file" \
+      > "$clen_file"
 
-  ## Reset from previews invocation of curl_download, which calls print_progress.
+  ## Sanitize and bound the server-supplied Content-Length before
+  ## using it in arithmetic. sanitize-string strips control characters
+  ## and caps the length; 18 digits is ~1 EB, safely within bash's
+  ## signed 64-bit integer range (max 9.22 * 10^18). Without this, a
+  ## server could send an absurdly long Content-Length string and
+  ## cause bash's `[ X -gt Y ]` to error on overflow, DoSing the
+  ## script via the ERR trap.
+  curl_prgrs_content_length=""
+  if test -f "$clen_file"; then
+    curl_prgrs_content_length="$(sanitize-string -- 18 < "$clen_file" 2>/dev/null || true)"
+  fi
+
+  ## Reset from previous invocation of curl_download, which calls print_progress.
   percent_last=""
 
   true "${BASH_SOURCE[0]} INFO: Header download done."
 
   if ! is_whole_number "$curl_prgrs_content_length" ; then
-    curl_exit 116
+    handle_unknown_content_length
   fi
 
   true "${BASH_SOURCE[0]} INFO: Download file..."
 
-  ## Launching into the background required.
-  ## If attempting to refactor this, make sure signal sigterm stops downloads.
-  header_download="false" curl_download "$@" &
+  ## Foreground execution: curl_download runs in the parent shell, so
+  ## curl_pid is directly accessible to the shutdown handler and no
+  ## subshell bookkeeping is needed. A trapped signal (SIGINT/SIGTERM/
+  ## SIGHUP) fires after the polling loop's current `sleep 1` returns,
+  ## i.e. within ~1 second. A failure inside curl_download propagates
+  ## via set -e / the ERR trap and shutdown reads the specific status
+  ## from the statusfile.
+  ##
+  ## --output "$CURL_OUT_FILE" is pinned here, before the user's args,
+  ## so that curl always writes to the file the 81 max-filesize
+  ## watchdog stats. scan_curl_arguments already stripped any user
+  ## -o/--output/-O/--remote-name/-J/--remote-header-name from
+  ## download_arguments so they cannot redirect curl elsewhere.
+  ## Placing --output first (and not after any potential user `--`)
+  ## guarantees curl parses it as an option rather than a URL.
+  header_download="false" curl_download \
+    --output "$CURL_OUT_FILE" \
+    "${download_arguments[@]}"
 
-  wait_exit_code=0
-  wait "$!" &>/dev/null || { wait_exit_code=$? ; true; };
   true "${BASH_SOURCE[0]} INFO: File download done."
   true "${BASH_SOURCE[0]} INFO: END."
-  exit "$wait_exit_code"
 }
 
-traps_enable
+## FD 4 must be opened before traps are installed: the shutdown handler
+## writes diagnostics to >&4, and an early failure before
+## initialize_terminal would otherwise hit "Bad file descriptor".
 initialize_terminal
+traps_enable
 initialize_variables
 check_variables
 main "$@"
