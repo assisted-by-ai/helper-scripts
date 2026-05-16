@@ -181,7 +181,7 @@ def main() -> int:
     global USE_COLOR
     USE_COLOR = (
         not os.getenv("NOCOLOR")
-        and not os.getenv("NO_COLOR")
+        and os.getenv("NO_COLOR") is None
         and os.getenv("TERM") != "dumb"
         and sys.stdout.isatty()
     )
